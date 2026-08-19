@@ -1,0 +1,13 @@
+chrome_profile/
+Hiring_cafe/chrome_profile/
+GlassD/chrome_profile/
+Jobgether/chrome_profile/  
+Hiring_cafe/*.json
+GlassD/*.json
+Jobgether/*.json
+Hiring_cafe/*.csv
+GlassD/*.csv
+Jobgether/*.csv
+Hiring_cafe/*.xlsx
+GlassD/*.xlsx
+Jobgether/*.xlsx
