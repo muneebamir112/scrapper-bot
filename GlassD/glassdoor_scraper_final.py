@@ -13,7 +13,7 @@ PROFILE_DIR = r'C:\Users\webNcodes\AppData\Local\Google\Chrome\User Data\Profile
 # PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chrome_profile")
 
 # Google Sheet that scraped jobs are mirrored into (in addition to glassdoor.xlsx).
-# Existing sheet layout: No | Company Name | Job Title | Location | Job Age | Job Link | Status | Date Added
+# Existing sheet layout: No | Company Name | Job Title | Location | Job Age | Job Link | Date Added | Source
 GOOGLE_SHEET_ID = "1FsPR9t-BB1GZ6kWfANnrDfq4p9XobDuA1tVB4D2sJDg"
 SERVICE_ACCOUNT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "service_account.json")
 EXCEL_HEADER = ["Company", "Job Title", "Location", "Job Age", "Application Link"]
@@ -487,10 +487,10 @@ def main():
                         try:
                             sheet_row = [
                                 str(sheet_next_no), company, job_t, loc, job_age,
-                                make_link_formula(app_url), "Pending", date.today().strftime("%m/%d/%Y"),
+                                make_link_formula(app_url), date.today().strftime("%m/%d/%Y"),
                                 "Glassdoor",
                             ]
-                            sheet.update(range_name=f"A{sheet_next_row}:I{sheet_next_row}", values=[sheet_row], value_input_option="USER_ENTERED")
+                            sheet.update(range_name=f"A{sheet_next_row}:H{sheet_next_row}", values=[sheet_row], value_input_option="USER_ENTERED")
                             sheet_next_row += 1
                             sheet_next_no += 1
                         except Exception as e:

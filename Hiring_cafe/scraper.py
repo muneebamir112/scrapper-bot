@@ -17,7 +17,7 @@ PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chrome_p
 
 # Same Google Sheet + service account GlassD's scraper uses, so job links from
 # every platform land in one place (Sheet1: No | Company Name | Job Title |
-# Location | Job Age | Job Link | Status | Date Added).
+# Location | Job Age | Job Link | Date Added | Source).
 GOOGLE_SHEET_ID = "1FsPR9t-BB1GZ6kWfANnrDfq4p9XobDuA1tVB4D2sJDg"
 SERVICE_ACCOUNT_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "GlassD", "service_account.json"
@@ -169,10 +169,10 @@ def sync_one_job_to_sheet(sheet, job, seen_links, seen_jobs, next_row, next_no):
     try:
         sheet_row = [
             str(next_no), job.get("company", ""), job.get("title", ""),
-            job.get("location", ""), job.get("posted", ""), make_link_formula(link), "Pending",
+            job.get("location", ""), job.get("posted", ""), make_link_formula(link),
             date.today().strftime("%m/%d/%Y"), "Hiring Cafe",
         ]
-        sheet.update(range_name=f"A{next_row}:I{next_row}", values=[sheet_row], value_input_option="USER_ENTERED")
+        sheet.update(range_name=f"A{next_row}:H{next_row}", values=[sheet_row], value_input_option="USER_ENTERED")
         seen_links.add(link)
         seen_jobs.add(job_key)
         return next_row + 1, next_no + 1
