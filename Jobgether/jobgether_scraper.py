@@ -240,10 +240,15 @@ async def main():
                         if (sib) posted = sib.textContent.trim();
                     }
                     let company = '';
-                    const card = a.closest('div.p-6') || a.closest('[class*="p-6"]');
+                    const card = a.closest('li') || a.closest('div.group') || a.parentElement.parentElement.parentElement;
                     if (card) {
                         const companyA = card.querySelector('a[href*="/remote-jobs/company-"], a[href*="/search-offers?company="]');
                         if (companyA) company = companyA.textContent.trim();
+                        // fallback to finding the img alt attribute just in case the link goes away
+                        if (!company) {
+                            const img = card.querySelector('img[alt]');
+                            if (img) company = img.getAttribute('alt');
+                        }
                     }
                     out.push({title: a.textContent.trim(), href: href, posted: posted, company: company});
                 }
