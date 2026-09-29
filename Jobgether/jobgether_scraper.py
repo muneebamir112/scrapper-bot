@@ -17,7 +17,10 @@ PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chrome_p
 # Same Google Sheet + service account GlassD's scraper uses, so job links from
 # every platform land in one place (Sheet1: No | Company Name | Job Title |
 # Location | Job Age | Job Link | Date Added | Source).
-GOOGLE_SHEET_ID = "1FsPR9t-BB1GZ6kWfANnrDfq4p9XobDuA1tVB4D2sJDg"
+import os
+from dotenv import load_dotenv
+load_dotenv(r"c:\Users\webNcodes\Desktop\webncodes\Job-Bot\.env")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1Kva2y5-54LXBWMTzNk_xp524ZE7N-CWiqL3VGATUZVM")
 SERVICE_ACCOUNT_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "..", "GlassD", "service_account.json"
 )
