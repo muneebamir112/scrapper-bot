@@ -16,21 +16,27 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import date
 
+if getattr(sys, 'frozen', False):
+    CURRENT_DIR = os.path.dirname(sys.executable)
+else:
+    CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+BASE_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
+LAUNCHER_DIR = os.path.join(BASE_DIR, "Job-bot-launcher")
+
 # Persistent Chrome profile for the stealth browser (same patchright approach
 # GlassD's scraper uses), kept separate from GlassD's own profile so each
 # platform's login/session state stays independent.
-PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chrome_profile")
+PROFILE_DIR = os.path.join(CURRENT_DIR, "chrome_profile")
 
 # Same Google Sheet + service account GlassD's scraper uses, so job links from
 # every platform land in one place (Sheet1: No | Company Name | Job Title |
 # Location | Job Age | Job Link | Date Added | Source).
 import os
 from dotenv import load_dotenv
-load_dotenv(r"c:\Users\webNcodes\Desktop\webncodes\Job-Bot\.env")
+load_dotenv(os.path.join(LAUNCHER_DIR, ".env"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1Kva2y5-54LXBWMTzNk_xp524ZE7N-CWiqL3VGATUZVM")
-SERVICE_ACCOUNT_FILE = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "..", "GlassD", "service_account.json"
-)
+SERVICE_ACCOUNT_FILE = os.path.join(LAUNCHER_DIR, "service_account.json")
 
 
 def get_google_sheet():
@@ -59,8 +65,18 @@ def find_next_sheet_slot(worksheet):
     company_col = worksheet.col_values(2)
     
     if len(company_col) == 0 or (len(company_col) == 1 and not company_col[0].strip()):
-        headers = ["No", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Added", "Platform"]
+        headers = ["", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform"]
         worksheet.update(range_name="A1:H1", values=[headers], value_input_option="USER_ENTERED")
+        
+        # Format headers to match the user's yellow, bold, centered style
+        try:
+            worksheet.format("A1:H1", {
+                "backgroundColor": {"red": 0.99, "green": 0.89, "blue": 0.58},
+                "textFormat": {"bold": True, "fontSize": 10},
+                "horizontalAlignment": "CENTER",
+            })
+        except Exception as e:
+            print(f"  Could not format headers: {e}")
         return 2, 1
         
     next_row = len(company_col) + 1
