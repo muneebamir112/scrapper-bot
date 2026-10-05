@@ -1,3 +1,9 @@
+import os
+import sys
+if not os.environ.get("JOBBOT_LAUNCHER_AUTH"):
+    import ctypes
+    ctypes.windll.user32.MessageBoxW(0, "Access Denied: This module must be run from the Job Bot Launcher.", "Security Alert", 0x10)
+    sys.exit(1)
 import asyncio
 import re
 import json

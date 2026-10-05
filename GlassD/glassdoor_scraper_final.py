@@ -3,6 +3,19 @@ from openpyxl import Workbook
 import gspread
 from google.oauth2.service_account import Credentials
 import os
+import sys
+
+import os
+import sys
+if not os.environ.get("JOBBOT_LAUNCHER_AUTH"):
+    import ctypes
+    ctypes.windll.user32.MessageBoxW(0, "Access Denied: This module must be run from the Job Bot Launcher.", "Security Alert", 0x10)
+    sys.exit(1)
+import os
+if getattr(sys, 'frozen', False):
+    CURRENT_DIR = os.path.dirname(sys.executable)
+else:
+    CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 import re
 import sys
 from datetime import date
@@ -10,15 +23,16 @@ from datetime import date
 # Persistent Chrome profile used by the stealth browser. Login state (and any
 # cookies needed to avoid Glassdoor's bot checks) is kept here between runs.
 PROFILE_DIR = r'C:\Users\webNcodes\AppData\Local\Google\Chrome\User Data\Profile 9'
-# PROFILE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chrome_profile")
+# PROFILE_DIR = os.path.join(CURRENT_DIR, "chrome_profile")
 
 # Google Sheet that scraped jobs are mirrored into (in addition to glassdoor.xlsx).
 # Existing sheet layout: No | Company Name | Job Title | Location | Job Age | Job Link | Date Added | Source
 import os
 from dotenv import load_dotenv
-load_dotenv(r"c:\Users\webNcodes\Desktop\webncodes\Job-Bot\.env")
+import os
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(CURRENT_DIR)), "Job-Bot", ".env"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1Kva2y5-54LXBWMTzNk_xp524ZE7N-CWiqL3VGATUZVM")
-SERVICE_ACCOUNT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "service_account.json")
+SERVICE_ACCOUNT_FILE = os.path.join(CURRENT_DIR, "service_account.json")
 EXCEL_HEADER = ["Company", "Job Title", "Location", "Job Age", "Application Link"]
 
 def get_google_sheet():
@@ -39,17 +53,22 @@ def get_google_sheet():
         return None
 
 def find_next_sheet_slot(worksheet):
-    """The sheet already has a No/Company Name/.../Status/Date Added layout with
-    pre-filled blank placeholder rows (Status='Pending' set ahead of time). Find the
-    first row whose Company Name cell is still empty so new jobs fill those rows in
-    order instead of being appended after them, and derive the next 'No' value from
-    the row directly above it."""
-    company_col = worksheet.col_values(2)  # column B, includes header at index 0
+    """Finds the first empty row by looking for empty cells in the Company column (B).
+    If the sheet is completely empty, it writes the headers to row 1."""
+    company_col = worksheet.col_values(2)  # column B
+    
+    if len(company_col) == 0 or (len(company_col) == 1 and not company_col[0].strip()):
+        # Sheet is completely empty (or missing column B). Write headers!
+        headers = ["No", "Company Name", "Job Title", "Location", "Date Scraped", "Job Link", "Source", "Cover Letter"]
+        worksheet.update(range_name="A1:H1", values=[headers], value_input_option="USER_ENTERED")
+        return 2, 1
+        
     next_row = len(company_col) + 1
     for i in range(1, len(company_col)):
         if not company_col[i].strip():
             next_row = i + 1
             break
+            
     return next_row, next_row - 1
 
 def load_seen_links(worksheet):
