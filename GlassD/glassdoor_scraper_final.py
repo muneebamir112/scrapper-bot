@@ -46,7 +46,11 @@ def get_google_sheet():
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
         client = gspread.authorize(creds)
-        worksheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            worksheet = spreadsheet.worksheet("Jobs")
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title="Jobs", rows=1000, cols=20)
         return worksheet
     except Exception as e:
         print(f"  Google Sheets connection failed: {e}")
@@ -59,7 +63,7 @@ def find_next_sheet_slot(worksheet):
     
     if len(company_col) == 0 or (len(company_col) == 1 and not company_col[0].strip()):
         # Sheet is completely empty (or missing column B). Write headers!
-        headers = ["No", "Company Name", "Job Title", "Location", "Date Scraped", "Job Link", "Source", "Cover Letter"]
+        headers = ["No", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Added", "Platform"]
         worksheet.update(range_name="A1:H1", values=[headers], value_input_option="USER_ENTERED")
         return 2, 1
         

@@ -43,7 +43,11 @@ def get_google_sheet():
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scopes)
         client = gspread.authorize(creds)
-        worksheet = client.open_by_key(GOOGLE_SHEET_ID).sheet1
+        spreadsheet = client.open_by_key(GOOGLE_SHEET_ID)
+        try:
+            worksheet = spreadsheet.worksheet("Jobs")
+        except gspread.exceptions.WorksheetNotFound:
+            worksheet = spreadsheet.add_worksheet(title="Jobs", rows=1000, cols=20)
         return worksheet
     except Exception as e:
         print(f"  Google Sheets connection failed: {e}")
@@ -51,16 +55,29 @@ def get_google_sheet():
 
 
 def find_next_sheet_slot(worksheet):
-    """Find the first row whose Company Name cell (column B) is still empty so
-    new jobs fill pre-existing placeholder rows in order, deriving the next
-    'No' value from the row directly above it."""
     company_col = worksheet.col_values(2)
+    
+    if len(company_col) == 0 or (len(company_col) == 1 and not company_col[0].strip()):
+        headers = ["No", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Added", "Platform"]
+        worksheet.update(range_name="A1:H1", values=[headers], value_input_option="USER_ENTERED")
+        return 2, 1
+        
     next_row = len(company_col) + 1
     for i in range(1, len(company_col)):
         if not company_col[i].strip():
             next_row = i + 1
             break
-    return next_row, next_row - 1
+            
+    try:
+        no_col = worksheet.col_values(1)
+        if next_row - 1 < len(no_col) and no_col[next_row - 1].isdigit():
+            next_no = int(no_col[next_row - 1]) + 1
+        else:
+            next_no = max([int(x) for x in no_col[1:] if x.isdigit()] + [0]) + 1
+    except:
+        next_no = 1
+        
+    return next_row, next_no
 
 
 def load_seen_links(worksheet):
@@ -303,7 +320,12 @@ async def main():
                     }""")
 
                     if apply_link and looks_like_captcha(apply_link, ""):
+                        print(f"  [{i}] Skipped: apply link looks like a CAPTCHA gate")
                         apply_link = None
+                    elif not apply_link:
+                        print(f"  [{i}] Skipped: could not find apply link on page")
+                    else:
+                        print(f"  [{i}] Saving job: {apply_link}")
 
                     if apply_link:
                         job_data = {
