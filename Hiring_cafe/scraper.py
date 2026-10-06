@@ -18,16 +18,16 @@ from datetime import date
 
 if getattr(sys, 'frozen', False):
     CURRENT_DIR = os.path.dirname(sys.executable)
+    LAUNCHER_DIR = CURRENT_DIR
 else:
     CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-BASE_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
-LAUNCHER_DIR = os.path.join(BASE_DIR, "Job-bot-launcher")
+    BASE_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
+    LAUNCHER_DIR = os.path.join(BASE_DIR, "Job-bot-launcher")
 
 # Persistent Chrome profile for the stealth browser (same patchright approach
 # GlassD's scraper uses), kept separate from GlassD's own profile so each
 # platform's login/session state stays independent.
-PROFILE_DIR = os.path.join(CURRENT_DIR, "chrome_profile")
+PROFILE_DIR = os.path.join(CURRENT_DIR, "profiles", "hiringcafe_profile")
 
 # Same Google Sheet + service account GlassD's scraper uses, so job links from
 # every platform land in one place (Sheet1: No | Company Name | Job Title |
@@ -239,7 +239,16 @@ async def main():
         )
         page = context.pages[0] if context.pages else await context.new_page()
 
-        await page.goto("https://hiring.cafe/", wait_until="domcontentloaded", timeout=60000)
+        for attempt in range(4):
+            try:
+                await page.goto("https://hiring.cafe/", wait_until="domcontentloaded", timeout=60000)
+                break
+            except Exception as e:
+                if attempt == 3:
+                    print("Network error: Could not reach hiring.cafe after multiple attempts. Please check your internet connection.")
+                    return
+                print(f"Network hiccup reaching hiring.cafe, retrying ({attempt + 1}/3)...")
+                await asyncio.sleep(2)
 
         # Step 2/3: Click to show cards, then set the location. The site
         # occasionally hasn't finished rendering its search UI yet (more

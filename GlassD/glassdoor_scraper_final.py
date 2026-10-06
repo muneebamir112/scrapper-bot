@@ -18,13 +18,13 @@ from dotenv import load_dotenv
 
 if getattr(sys, 'frozen', False):
     CURRENT_DIR = os.path.dirname(sys.executable)
+    LAUNCHER_DIR = CURRENT_DIR
 else:
     CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+    BASE_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
+    LAUNCHER_DIR = os.path.join(BASE_DIR, "Job-bot-launcher")
 
-BASE_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
-LAUNCHER_DIR = os.path.join(BASE_DIR, "Job-bot-launcher")
-
-PROFILE_DIR = r'C:\Users\webNcodes\AppData\Local\Google\Chrome\User Data\Profile 9'
+PROFILE_DIR = os.path.join(CURRENT_DIR, "profiles", "glassdoor_profile")
 
 load_dotenv(os.path.join(LAUNCHER_DIR, ".env"))
 GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1Kva2y5-54LXBWMTzNk_xp524ZE7N-CWiqL3VGATUZVM")
@@ -239,7 +239,16 @@ def main():
 
         try:
             # Step 1: Navigate to Glassdoor Jobs
-            page.goto("https://www.glassdoor.com/Job/index.htm", timeout=30000, wait_until="domcontentloaded")
+            for attempt in range(4):
+                try:
+                    page.goto("https://www.glassdoor.com/Job/index.htm", timeout=60000, wait_until="domcontentloaded")
+                    break
+                except Exception as e:
+                    if attempt == 3:
+                        print("Network error: Could not reach glassdoor.com after multiple attempts. Please check your internet connection.")
+                        return
+                    print(f"Network hiccup reaching glassdoor.com, retrying ({attempt + 1}/3)...")
+                    page.wait_for_timeout(2000)
             page.wait_for_timeout(2000)
             
             # Close popups
