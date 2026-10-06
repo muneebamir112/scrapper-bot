@@ -11,3 +11,9 @@ Jobgether/*.csv
 Hiring_cafe/*.xlsx
 GlassD/*.xlsx
 Jobgether/*.xlsx
+build/
+dist/
+*.spec
+__pycache__/
+.env
+service_account.json
