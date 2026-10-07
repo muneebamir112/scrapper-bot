@@ -17,3 +17,6 @@ dist/
 __pycache__/
 .env
 service_account.json
+Jobgether/profiles/
+Hiring_cafe/profiles/
+GlassD/profiles/

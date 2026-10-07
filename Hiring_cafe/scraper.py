@@ -7,7 +7,7 @@ if not os.environ.get("JOBBOT_LAUNCHER_AUTH"):
 import asyncio
 import re
 import json
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs, urlencode, quote
 from patchright.async_api import async_playwright
 import openpyxl
 import sys
@@ -239,199 +239,79 @@ async def main():
         )
         page = context.pages[0] if context.pages else await context.new_page()
 
+        # Instead of trying to click through the UI (which frequently changes
+        # and has a lot of A/B testing overlays), we construct the search URL
+        # directly. This is much faster and completely bypasses the FTUE banners,
+        # location selectors, and search boxes.
+        search_state = {
+            "searchQuery": keyword,
+            "workplaceTypes": ["Remote"],
+            "dateFetchedPastNDays": 2,
+            "locations": [{"value": location, "label": location}]
+        }
+        
+        encoded_state = quote(json.dumps(search_state))
+        search_url = f"https://hiringcafe.com/classic?searchState={encoded_state}"
+        
         for attempt in range(4):
             try:
-                await page.goto("https://hiring.cafe/", wait_until="domcontentloaded", timeout=60000)
+                print(f"  Navigating to search URL: {search_url}")
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+                await page.wait_for_timeout(5000)
                 break
             except Exception as e:
                 if attempt == 3:
-                    print("Network error: Could not reach hiring.cafe after multiple attempts. Please check your internet connection.")
+                    print("Network error: Could not reach hiringcafe.com after multiple attempts.")
                     return
-                print(f"Network hiccup reaching hiring.cafe, retrying ({attempt + 1}/3)...")
+                print(f"Network hiccup reaching hiringcafe.com, retrying ({attempt + 1}/3)...")
                 await asyncio.sleep(2)
 
-        # Step 2/3: Click to show cards, then set the location. The site
-        # occasionally hasn't finished rendering its search UI yet (more
-        # likely when several scrapers are running concurrently on the same
-        # machine), so the location input's click can time out - retry the
-        # whole sequence once with a fresh page load before giving up,
-        # instead of crashing the run on a single transient timeout.
-        #
-        # Step 3 itself: the site auto-detects a default location (e.g.
-        # based on IP) with every workplace type included, so typing a new
-        # one here and picking it from the suggestion list *replaces* that
-        # default entirely rather than adding a second one. This must happen
-        # before selecting Remote below - the site resets a location's
-        # workplace types back to "all types" whenever the location itself is
-        # (re)selected, so setting Remote first (the previous, buggy order)
-        # got silently wiped out as soon as the location was set afterward.
-        loc_input = None
-        for attempt in range(1, 3):
-            try:
-                await page.click('.hidden.md\\:flex.items-center.space-x-2.justify-between')
-                await page.wait_for_timeout(2000)
-            except Exception as e:
-                print(f"  Step 2 warning: {e}")
-
-            try:
-                candidate = page.locator("input").nth(1)
-                await candidate.click(timeout=10000)
-                loc_input = candidate
-                break
-            except Exception as e:
-                print(f"  Step 3 attempt {attempt} failed: {e}")
-                if attempt < 2:
-                    await page.goto("https://hiring.cafe/", wait_until="domcontentloaded", timeout=60000)
-                    await page.wait_for_timeout(2000)
-
-        if loc_input is None:
-            print("  Could not set location after retries, aborting this keyword.")
-            try:
-                await context.close()
-            except Exception:
-                pass
-            # Exit non-zero (rather than returning normally) so the launcher
-            # doesn't mistake this for a successful run and mark the keyword
-            # done when nothing was actually scraped.
-            sys.exit(1)
-
-        await page.keyboard.type(location, delay=50)
-        await page.wait_for_timeout(1500)
-        matched = await page.evaluate(
-            '''(loc) => {
-                const all = Array.from(document.querySelectorAll('li, [role="option"], div'));
-                const el = all.find(e => e.children.length === 0 && e.textContent.trim() === loc);
-                if (el) { el.click(); return true; }
-                return false;
-            }''',
-            location,
-        )
-        if not matched:
-            print(f"  Could not find an exact dropdown match for '{location}', pressing Enter as fallback")
-            await page.keyboard.press("Enter")
-        await page.wait_for_timeout(1500)
-
-        # Step 4: Open that location's own "Edit Location" panel and select
-        # Remote only (Onsite/Hybrid/Field left unchecked).
-        try:
-            await page.locator(f'button:has-text("{location}"):visible').first.click(timeout=10000)
-            await page.wait_for_timeout(1000)
-            await page.evaluate('''() => {
-                const labels = Array.from(document.querySelectorAll('label'));
-                const remoteLabel = labels.find(l => l.textContent.trim() === 'Remote');
-                if (remoteLabel) remoteLabel.click();
-            }''')
-            await page.wait_for_timeout(500)
-            await page.keyboard.press("Escape")
-            await page.wait_for_timeout(800)
-        except Exception as e:
-            print(f"  Could not open the location's environment editor: {e}")
-
-        # Step 5: Click Apply
-        await page.evaluate('''() => {
-            const buttons = document.querySelectorAll('button');
-            for (let btn of buttons) {
-                if (btn.textContent && btn.textContent.trim() === 'Apply') {
-                    const r = btn.getBoundingClientRect();
-                    if (r.width > 0 && r.height > 0) { btn.click(); return true; }
-                }
-            }
-            return false;
-        }''')
-        await page.wait_for_timeout(3000)
-
-        # Step 7: Search for keyword
-        try:
-            await page.fill('#query-search-v4', keyword)
-            await page.keyboard.press("Enter")
-        except Exception as e:
-            print(f"  Search failed: {e}")
-        await page.wait_for_timeout(7000)  # Wait for page to load
-
-        # Apply hiring.cafe's own "Date Posted: Past 24 hours" filter
-        # (dateFetchedPastNDays=2 in its searchState) instead of paging
-        # through hundreds/thousands of listings and filtering them out
-        # client-side afterward - this cuts a search like "Backend Engineer"
-        # from ~750+ cards across 20 pages down to a handful on one page.
-        #
-        # Also force each location's workplace_types to exactly ["Remote"]
-        # here, directly in the searchState, instead of relying only on the
-        # Step 3/4 UI clicks above. Those clicks depend on hiring.cafe's
-        # location-editor panel opening and rendering in time, which doesn't
-        # always happen (e.g. a "Locations & Environments" modal appearing
-        # unprompted) - when it silently fails, the search is left at its
-        # "All Environments" default and Onsite/Hybrid jobs leak into the
-        # results. Setting it here guarantees Remote-only regardless of
-        # whether that earlier click chain actually landed.
-        try:
-            parsed = urlparse(page.url)
-            query = parse_qs(parsed.query)
-            search_state = json.loads(query["searchState"][0])
-            search_state["dateFetchedPastNDays"] = 2
-            for loc in search_state.get("locations", []):
-                loc["workplace_types"] = ["Remote"]
-            query["searchState"] = [json.dumps(search_state)]
-            new_query = urlencode({k: v[0] for k, v in query.items()})
-            date_filtered_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{new_query}"
-            await page.goto(date_filtered_url, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_timeout(3000)
-        except Exception as e:
-            print(f"  Could not apply date/remote filters, falling back to client-side filtering only: {e}")
-
-        # We'll collect all job links from all pages
+        # Hiring Cafe uses URL pagination. We'll collect up to 50 links.
         all_job_links = []
         page_num = 1
-
+        
+        print("  Collecting job links across pages...")
         while True:
-            # Each page's work is wrapped so that a crash partway through
-            # pagination (e.g. the site closing the page/browser, as seen
-            # with a TargetClosedError around page 14) stops pagination
-            # instead of raising out of main() — otherwise every link
-            # collected on the pages before the crash would be lost, since
-            # extraction and the Google Sheets sync only happen after this
-            # loop ends.
             try:
-                # Scroll down to load all job cards on current page
-                for _ in range(10):
-                    await page.evaluate('window.scrollBy(0, document.body.scrollHeight)')
-                    await page.wait_for_timeout(500)
-                await page.wait_for_timeout(2000)
-
-                # Extract job links from current page
+                # Wait for job links to load
                 try:
                     await page.wait_for_selector('a[href^="/job/"]', timeout=10000)
                 except:
+                    print(f"  No more jobs found on page {page_num}.")
                     break
 
-                page_job_links = await page.eval_on_selector_all(
+                current_links = await page.eval_on_selector_all(
                     'a[target="_blank"][rel="noopener noreferrer"][href^="/job/"]',
                     'els => els.map(e => e.href)'
                 )
-                page_job_links = list(dict.fromkeys(page_job_links))
-
-                if len(page_job_links) == 0:
+                
+                unique_links = list(dict.fromkeys(current_links))
+                if len(unique_links) == 0:
                     break
-
-                all_job_links.extend(page_job_links)
+                    
+                all_job_links.extend(unique_links)
+                all_job_links = list(dict.fromkeys(all_job_links))
+                print(f"  Page {page_num}: Found {len(unique_links)} links. Total collected: {len(all_job_links)}")
+                
+                if len(all_job_links) >= 50:
+                    print(f"  Collected enough links ({len(all_job_links)}). Stopping pagination.")
+                    break
 
                 # Prepare for next page
                 current_url = page.url
-                # Remove any existing page parameter and set the new page number
                 if 'page=' in current_url:
                     base_url = current_url.split('&page=')[0]
                 else:
                     base_url = current_url
-                next_url = f"{base_url}&page={page_num}"
-                # Extra pacing delay before navigating - back-to-back page
-                # loads with no gap look bursty and appear to be what gets
-                # this connection cut around page 14 (ERR_ABORTED / frame
-                # detached), losing the browser for the rest of the run.
-                await page.wait_for_timeout(5000)
+                next_url = f"{base_url}&page={page_num + 1}"
+                
+                await page.wait_for_timeout(2000)
                 await page.goto(next_url, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(3000)  # Wait for page to load
+                await page.wait_for_timeout(3000)
                 page_num += 1
+                
             except Exception as e:
-                print(f"  Page {page_num} failed ({e}); stopping pagination with {len(all_job_links)} links collected so far")
+                print(f"  Page {page_num} failed ({e}); stopping pagination...")
                 break
 
         # Remove duplicates across pages

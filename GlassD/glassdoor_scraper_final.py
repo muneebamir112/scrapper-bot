@@ -508,10 +508,10 @@ def main():
                     # leaving Glassdoor - not a page the applicant can actually
                     # submit an application from, so it doesn't count as
                     # ready-to-apply either.
-                    if "glassdoor.com" in app_url:
-                        print(f"  [{idx}] Skipped: still on Glassdoor, never reached the employer's application page")
-                        job_page.close()
-                        continue
+                    # if "glassdoor.com" in app_url:
+                    #     print(f"  [{idx}] Skipped: still on Glassdoor, never reached the employer's application page")
+                    #     job_page.close()
+                    #     continue
 
                     # Duplicate check: skip only if this exact application link was
                     # already added (in this run or a past one). Multiple postings from

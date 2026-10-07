@@ -1,3 +1,5 @@
-2026/10/07-22:16:57.866 e78 Reusing MANIFEST D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\Local Storage\leveldb/MANIFEST-000001
-2026/10/07-22:16:57.868 e78 Recovering log #3
-2026/10/07-22:16:57.871 e78 Reusing old log D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\Local Storage\leveldb/000003.log 
+2026/10/08-03:15:30.851 47bc Reusing MANIFEST D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/10/08-03:15:30.853 47bc Recovering log #4
+2026/10/08-03:15:30.853 47bc Level-0 table #6: started
+2026/10/08-03:15:33.152 47bc Level-0 table #6: 15507 bytes OK
+2026/10/08-03:15:33.347 47bc Delete type=0 #4
