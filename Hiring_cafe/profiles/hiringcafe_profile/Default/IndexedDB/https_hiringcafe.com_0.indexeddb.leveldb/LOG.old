@@ -1,0 +1,13 @@
+2026/10/07-22:17:28.616 1760 Reusing MANIFEST D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\IndexedDB\https_hiringcafe.com_0.indexeddb.leveldb/MANIFEST-000001
+2026/10/07-22:17:28.616 1760 Recovering log #6
+2026/10/07-22:17:28.616 1760 Reusing old log D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\IndexedDB\https_hiringcafe.com_0.indexeddb.leveldb/000006.log 
+2026/10/07-22:17:32.863 4110 Level-0 table #10: started
+2026/10/07-22:17:33.088 4110 Level-0 table #10: 948 bytes OK
+2026/10/07-22:17:33.412 4110 Delete type=0 #6
+2026/10/07-22:17:33.412 2cd8 Manual compaction at level-0 from '\x00\x05\x00\x00\x00' @ 72057594037927935 : 1 .. '\x00\x06\x00\x00\x00' @ 0 : 0; will stop at '\x00\x05\x00\x00\x05' @ 165 : 1
+2026/10/07-22:17:33.413 2cd8 Compacting 1@0 + 1@1 files
+2026/10/07-22:17:33.637 2cd8 Generated table #11@0: 53 keys, 1494 bytes
+2026/10/07-22:17:33.637 2cd8 Compacted 1@0 + 1@1 files => 1494 bytes
+2026/10/07-22:17:33.725 2cd8 compacted to: files[ 0 1 1 0 0 0 0 ]
+2026/10/07-22:17:33.727 2cd8 Delete type=2 #10
+2026/10/07-22:17:33.728 2cd8 Manual compaction at level-0 from '\x00\x05\x00\x00\x05' @ 165 : 1 .. '\x00\x06\x00\x00\x00' @ 0 : 0; will stop at (end)
