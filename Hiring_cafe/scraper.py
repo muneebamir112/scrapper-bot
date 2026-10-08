@@ -225,7 +225,7 @@ def sync_one_job_to_sheet(sheet, job, seen_links, seen_jobs, next_row, next_no):
 
 async def main():
     keyword = sys.argv[1] if len(sys.argv) > 1 else "Full stack developer"
-    location = sys.argv[2] if len(sys.argv) > 2 else "canada"
+    location = sys.argv[2] if len(sys.argv) > 2 else "United States"
 
     jobs = []
 
@@ -244,10 +244,31 @@ async def main():
         # directly. This is much faster and completely bypasses the FTUE banners,
         # location selectors, and search boxes.
         search_state = {
-            "searchQuery": keyword,
-            "workplaceTypes": ["Remote"],
-            "dateFetchedPastNDays": 2,
-            "locations": [{"value": location, "label": location}]
+            "locations": [
+                {
+                    "formatted_address": location,
+                    "types": ["country"],
+                    "geometry": {
+                        "location": {
+                            "lat": 31.558,
+                            "lon": 74.35071
+                        }
+                    },
+                    "id": "user_country",
+                    "address_components": [
+                        {
+                            "long_name": location,
+                            "short_name": "US" if "united states" in location.lower() else location[:2].upper(),
+                            "types": ["country"]
+                        }
+                    ],
+                    "options": {
+                        "flexible_regions": []
+                    },
+                    "workplace_types": ["Remote"]
+                }
+            ],
+            "searchQuery": keyword
         }
         
         encoded_state = quote(json.dumps(search_state))
@@ -255,9 +276,82 @@ async def main():
         
         for attempt in range(4):
             try:
+                print("  Clearing local storage to prevent default saved modes...")
+                await page.goto("https://hiringcafe.com/", timeout=60000)
+                await page.evaluate("window.localStorage.clear(); window.sessionStorage.clear();")
+                await page.wait_for_timeout(1000)
+
                 print(f"  Navigating to search URL: {search_url}")
                 await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
                 await page.wait_for_timeout(5000)
+                
+                # 1. Open the filter modal by clicking the chip if it exists
+                try:
+                    chip_selector = "button.flex.items-center.space-x-4"
+                    await page.wait_for_selector(chip_selector, timeout=5000)
+                    await page.click(chip_selector)
+                    await page.wait_for_timeout(2000)
+                    
+                    # 2. Inside the modal, ensure Remote is checked and others unchecked
+                    await page.evaluate('''() => {
+                        const buttons = Array.from(document.querySelectorAll('button, div[role="button"], label'));
+                        
+                        buttons.forEach(btn => {
+                            const txt = (btn.textContent || '').trim().toLowerCase();
+                            const isChecked = btn.getAttribute('aria-checked') === 'true' || 
+                                              btn.getAttribute('data-state') === 'checked' || 
+                                              btn.classList.contains('bg-pink-600') ||
+                                              (btn.querySelector('input') && btn.querySelector('input').checked);
+                            
+                            if ((txt === 'onsite' || txt === 'on-site' || txt === 'hybrid' || txt === 'field') && isChecked) {
+                                btn.click();
+                            } else if (txt === 'remote' && !isChecked) {
+                                btn.click();
+                            }
+                        });
+                    }''')
+                    await page.wait_for_timeout(1000)
+                    
+                    # 3. If there is a location input, set it to United States
+                    await page.evaluate('''() => {
+                        const locInput = document.querySelector('input[placeholder*="location" i], input[placeholder*="country" i]');
+                        if (locInput) {
+                            locInput.value = 'United States';
+                            locInput.dispatchEvent(new Event('input', { bubbles: true }));
+                        }
+                    }''')
+                    await page.wait_for_timeout(1000)
+                    
+                    # 4. Click Apply or close modal
+                    await page.evaluate('''() => {
+                        const applyBtn = Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').trim().toLowerCase() === 'apply');
+                        if (applyBtn) {
+                            applyBtn.click();
+                        } else {
+                            // Press escape if no apply button
+                            document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+                        }
+                    }''')
+                    await page.wait_for_timeout(3000)
+                    
+                except Exception as e:
+                    print("  Could not interact with filter modal (maybe it didn't appear). Error:", e)
+
+                # Fallback: if the chip is STILL showing the wrong text after closing the modal, delete it
+                await page.evaluate('''() => {
+                    const chips = Array.from(document.querySelectorAll('div.bg-gray-200.rounded-md'));
+                    chips.forEach(chip => {
+                        const txt = chip.textContent || '';
+                        if (txt.includes('Hybrid') || txt.includes('Onsite') || txt.includes('Field') || (!txt.includes('United States') && !txt.includes('Remote'))) {
+                            const trash = chip.querySelector('svg.text-red-500');
+                            if (trash) {
+                                const btn = trash.closest('button');
+                                if (btn) btn.click();
+                            }
+                        }
+                    });
+                }''')
+                await page.wait_for_timeout(2000)
                 break
             except Exception as e:
                 if attempt == 3:

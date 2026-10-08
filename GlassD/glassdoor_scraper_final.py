@@ -293,8 +293,24 @@ def main():
             page.wait_for_selector("li[data-test='jobListing']", timeout=30000)
             page.wait_for_timeout(3000)
             
-            # Step 5: Apply Remote filter
+            # Step 5: Apply Remote filter and ensure others are unchecked
             try:
+                # Uncheck Onsite/Hybrid if they are active
+                page.evaluate('''() => {
+                    const buttons = Array.from(document.querySelectorAll('button, [role="button"]'));
+                    buttons.forEach(btn => {
+                        const txt = (btn.textContent || '').trim().toLowerCase();
+                        const checked = btn.getAttribute('aria-checked') === 'true' || 
+                                        btn.getAttribute('data-checked') === 'true' || 
+                                        btn.querySelector('input:checked') != null;
+                        
+                        if ((txt.includes('onsite') || txt.includes('on-site') || txt.includes('hybrid')) && checked) {
+                            btn.click();
+                        }
+                    });
+                }''')
+                page.wait_for_timeout(1500)
+
                 page.click("button[data-test='remoteWorkType']", timeout=10000)
                 page.wait_for_timeout(3000)
                 try:

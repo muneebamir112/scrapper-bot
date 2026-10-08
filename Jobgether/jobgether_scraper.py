@@ -238,7 +238,7 @@ async def main():
     # explicitly in the URL guarantees remote-only regardless.
     target_url = (
         f"https://jobgether.com/search-offers?location={location_slug}"
-        f"&keyword={quote(keyword)}&sort=date&includeHybrid=false"
+        f"&keyword={quote(keyword)}&sort=date&includeHybrid=false&includeOnsite=false"
     )
 
     results = []
@@ -262,6 +262,11 @@ async def main():
 
         for attempt in range(4):
             try:
+                print("  Clearing local storage to prevent default saved modes...")
+                await page.goto("https://jobgether.com/", timeout=60000)
+                await page.evaluate("window.localStorage.clear(); window.sessionStorage.clear();")
+                await page.wait_for_timeout(1000)
+
                 await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
                 await page.wait_for_timeout(4000)
                 break
