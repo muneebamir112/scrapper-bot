@@ -59,7 +59,7 @@ def find_next_sheet_slot(worksheet):
     
     if len(company_col) == 0 or (len(company_col) == 1 and not company_col[0].strip()):
         # Sheet is completely empty (or missing column B). Write headers!
-        headers = ["", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform"]
+        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform"]
         worksheet.update(range_name="A1:H1", values=[headers], value_input_option="USER_ENTERED")
         
         # Format headers to match the user's yellow, bold, centered style
@@ -115,23 +115,29 @@ def load_seen_jobs(worksheet):
 
 def parse_job_age(age_text):
     """Convert job age text to numeric days for comparison."""
-    age_text = age_text.lower().strip()
-    # Match patterns: 23d, 5h, 2w, 1mo, 3mos, etc.
-    match = re.match(r'(\d+)(mo|mos|[dhmsw])', age_text)
-    if not match:
+    if not age_text:
         return 0
+    age_text = age_text.lower().strip()
+    if "today" in age_text or "just" in age_text or "now" in age_text:
+        return 0
+    # Match patterns: 23d, 5h, 2w, 1mo, 3mos, etc.
+    match = re.search(r'(\d+)\s*(mo|mos|[dhmsw]|days?|hrs?|hours?|mins?|minutes?|weeks?|months?)', age_text)
+    if not match:
+        return 0 # Default to accepting if unrecognized, since fromAge=1 URL filter is applied
+    
     value = int(match.group(1))
     unit = match.group(2)
-    if unit in ('h',):
+    
+    if unit in ('h', 'hr', 'hrs', 'hour', 'hours'):
         return value / 24
-    elif unit in ('d',):
+    elif unit in ('d', 'day', 'days'):
         return value
-    elif unit in ('w',):
+    elif unit in ('w', 'week', 'weeks'):
         return value * 7
-    elif unit in ('m', 'mo', 'mos'):
+    elif unit in ('m', 'mo', 'mos', 'month', 'months'):
         return value * 30
-    elif unit == 's':
-        return value / (24 * 7 * 4)
+    elif unit in ('s', 'min', 'mins', 'minute', 'minutes'):
+        return value / (24 * 60)
     return 0
 
 CAPTCHA_INDICATORS = [
@@ -392,12 +398,14 @@ def main():
 
                     # Extract job age and filter (skip if older than 24 hours)
                     job_age = "N/A"
+                    age_days = 0  # Default to accepting if age is missing, because fromAge=1 URL filter is applied
                     age_el = card.query_selector("[data-test='job-age'], .JobCard_listingAge__jJsuc, .jobAge, .listingAge")
                     if age_el:
                         job_age = age_el.inner_text().strip()
                         age_days = parse_job_age(job_age)
-                        if age_days > 1:
-                            continue
+                    
+                    if age_days > 1:
+                        continue
 
                     # Get job URL
                     link = card.query_selector("a[data-test='job-link'], a[href*='job/']")

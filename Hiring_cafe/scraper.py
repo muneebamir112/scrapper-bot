@@ -65,7 +65,7 @@ def find_next_sheet_slot(worksheet):
     company_col = worksheet.col_values(2)
     
     if len(company_col) == 0 or (len(company_col) == 1 and not company_col[0].strip()):
-        headers = ["", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform"]
+        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform"]
         worksheet.update(range_name="A1:H1", values=[headers], value_input_option="USER_ENTERED")
         
         # Format headers to match the user's yellow, bold, centered style
@@ -135,7 +135,7 @@ def is_within_24h(age_text):
     (except '0 days ago'). Unrecognized/empty text is treated as within 24h
     rather than silently dropping a job we can't confidently place."""
     if not age_text:
-        return True
+        return False
     text = age_text.lower().strip()
     if "just" in text or "today" in text or "now" in text:
         return True
@@ -148,10 +148,12 @@ def is_within_24h(age_text):
         return True
     value = int(match.group(1))
     unit = match.group(2)
-    if unit in ("h", "hr", "hrs", "hour", "hours", "m", "min", "mins", "minute", "minutes"):
+    if unit in ("h", "hr", "hrs", "hour", "hours"):
+        return value <= 24
+    if unit in ("m", "min", "mins", "minute", "minutes"):
         return True
     if unit in ("d", "day", "days"):
-        return value < 1
+        return value <= 1
     return False  # week/month
 
 
@@ -374,18 +376,41 @@ async def main():
                     print(f"  No more jobs found on page {page_num}.")
                     break
 
-                current_links = await page.eval_on_selector_all(
+                current_links_data = await page.eval_on_selector_all(
                     'a[target="_blank"][rel="noopener noreferrer"][href^="/job/"]',
-                    'els => els.map(e => e.href)'
+                    '''els => els.map(e => {
+                        let card = e.closest("div");
+                        for (let i=0; i<3; i++) { if (card && card.parentElement) card = card.parentElement; }
+                        return {href: e.href, text: card ? card.innerText : ""};
+                    })'''
                 )
                 
-                unique_links = list(dict.fromkeys(current_links))
-                if len(unique_links) == 0:
+                unique_links = []
+                for item in current_links_data:
+                    href = item['href']
+                    if href not in unique_links:
+                        text = item['text'].lower()
+                        if "today" in text or "just now" in text:
+                            unique_links.append(href)
+                            continue
+                        
+                        match = re.search(r'(?:posted)?\s*(\d+)\s*(mo|months?|w|weeks?|d|days?|h|hrs?|hours?|m|mins?|minutes?)(?:\s*ago)?\b', text)
+                        if match:
+                            value = int(match.group(1))
+                            unit = match.group(2)
+                            if unit in ("h", "hr", "hrs", "hour", "hours") and value <= 24:
+                                unique_links.append(href)
+                            elif unit in ("m", "min", "mins", "minute", "minutes"):
+                                unique_links.append(href)
+                            elif unit in ("d", "day", "days") and value <= 1:
+                                unique_links.append(href)
+                
+                if len(current_links_data) == 0:
                     break
                     
                 all_job_links.extend(unique_links)
                 all_job_links = list(dict.fromkeys(all_job_links))
-                print(f"  Page {page_num}: Found {len(unique_links)} links. Total collected: {len(all_job_links)}")
+                print(f"  Page {page_num}: Found {len(unique_links)} fresh jobs out of {len(current_links_data)}. Total collected: {len(all_job_links)}")
                 
                 if len(all_job_links) >= 50:
                     print(f"  Collected enough links ({len(all_job_links)}). Stopping pagination.")

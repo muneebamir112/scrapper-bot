@@ -64,7 +64,7 @@ def find_next_sheet_slot(worksheet):
     company_col = worksheet.col_values(2)
     
     if len(company_col) == 0 or (len(company_col) == 1 and not company_col[0].strip()):
-        headers = ["", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform"]
+        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform"]
         worksheet.update(range_name="A1:H1", values=[headers], value_input_option="USER_ENTERED")
         
         # Format headers to match the user's yellow, bold, centered style
@@ -194,19 +194,21 @@ def is_within_24h(age_text):
     '30+ days ago'), or any week/month unit, means more than 24 hours have
     already passed."""
     if not age_text:
-        return True
+        return False
     text = age_text.lower().strip()
     if "today" in text or "just" in text or "now" in text:
         return True
     match = re.search(r'(\d+)\+?\s*(day|days|hour|hours|minute|minutes|week|weeks|month|months)', text)
     if not match:
-        return True
+        return False
     value = int(match.group(1))
     unit = match.group(2)
-    if "hour" in unit or "minute" in unit:
+    if "hour" in unit:
+        return value <= 24
+    if "minute" in unit:
         return True
     if "day" in unit:
-        return value < 1
+        return value <= 1
     return False  # week/month
 
 
@@ -287,10 +289,22 @@ async def main():
                     if (seen.has(href) || href === '/offer/undefined') continue;
                     seen.add(href);
                     let posted = '';
-                    const parent = a.closest('div');
-                    if (parent) {
-                        const sib = parent.querySelector('div.text-xs.text-gray-500, div[class*="text-gray-500"]');
-                        if (sib) posted = sib.textContent.trim();
+                    const postedCard = a.closest('div.group') || a.parentElement.parentElement.parentElement;
+                    if (postedCard) {
+                        const fullText = postedCard.innerText;
+                        const lower = fullText.toLowerCase();
+                        if (lower.includes("just now")) {
+                            posted = "Just Now";
+                        } else if (lower.includes("today")) {
+                            posted = "Today";
+                        } else {
+                            const match = lower.match(/(\d+\+?\s*(?:day|days|hour|hours|minute|minutes|week|weeks|month|months)(?:\s*ago)?)/i);
+                            if (match) {
+                                posted = match[1];
+                            } else {
+                                posted = fullText.split('\\n')[1] || ''; // Fallback
+                            }
+                        }
                     }
                     let company = '';
                     const card = a.closest('li') || a.closest('div.group') || a.parentElement.parentElement.parentElement;
