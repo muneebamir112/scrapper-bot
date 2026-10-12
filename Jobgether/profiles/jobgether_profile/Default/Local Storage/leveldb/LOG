@@ -1,3 +1,6 @@
-2026/10/08-03:23:58.894 231c Reusing MANIFEST D:\webncodes\scraper\Jobgether\profiles\jobgether_profile\Default\Local Storage\leveldb/MANIFEST-000001
-2026/10/08-03:23:58.896 231c Recovering log #6
-2026/10/08-03:23:58.898 231c Reusing old log D:\webncodes\scraper\Jobgether\profiles\jobgether_profile\Default\Local Storage\leveldb/000006.log 
+2026/10/10-01:04:47.776 377c Reusing MANIFEST D:\webncodes\scraper\Jobgether\profiles\jobgether_profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/10/10-01:04:47.777 377c Recovering log #11
+2026/10/10-01:04:47.780 377c Reusing old log D:\webncodes\scraper\Jobgether\profiles\jobgether_profile\Default\Local Storage\leveldb/000011.log 
+2026/10/10-01:06:48.290 1818 Level-0 table #15: started
+2026/10/10-01:06:48.313 1818 Level-0 table #15: 17040 bytes OK
+2026/10/10-01:06:48.326 1818 Delete type=0 #11

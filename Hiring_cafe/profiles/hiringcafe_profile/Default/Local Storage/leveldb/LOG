@@ -1,3 +1,18 @@
-2026/10/08-03:23:55.024 9c0 Reusing MANIFEST D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\Local Storage\leveldb/MANIFEST-000001
-2026/10/08-03:23:55.026 9c0 Recovering log #7
-2026/10/08-03:23:55.029 9c0 Reusing old log D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\Local Storage\leveldb/000007.log 
+2026/10/10-01:04:47.408 2f80 Reusing MANIFEST D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/10/10-01:04:47.410 2f80 Recovering log #21
+2026/10/10-01:04:47.413 2f80 Reusing old log D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\Local Storage\leveldb/000021.log 
+2026/10/10-01:10:02.740 3fdc Level-0 table #24: started
+2026/10/10-01:10:02.761 3fdc Level-0 table #24: 16194 bytes OK
+2026/10/10-01:10:02.774 3fdc Delete type=0 #21
+2026/10/10-01:10:02.775 3fdc Compacting 4@0 + 1@1 files
+2026/10/10-01:10:02.793 3fdc Generated table #25@0: 17 keys, 3173 bytes
+2026/10/10-01:10:02.793 3fdc Compacted 4@0 + 1@1 files => 3173 bytes
+2026/10/10-01:10:02.806 3fdc compacted to: files[ 0 1 0 0 0 0 0 ]
+2026/10/10-01:10:02.807 3fdc Delete type=2 #13
+2026/10/10-01:10:02.807 3fdc Delete type=2 #16
+2026/10/10-01:10:02.807 3fdc Delete type=2 #18
+2026/10/10-01:10:02.807 3fdc Delete type=2 #20
+2026/10/10-01:10:02.807 3fdc Delete type=2 #24
+2026/10/10-01:12:48.598 3fdc Level-0 table #27: started
+2026/10/10-01:12:48.633 3fdc Level-0 table #27: 17206 bytes OK
+2026/10/10-01:12:48.645 3fdc Delete type=0 #23

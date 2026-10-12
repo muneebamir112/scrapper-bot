@@ -1,2 +1,5 @@
-2026/10/08-03:23:55.134 9c0 Creating DB D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\Session Storage since it was missing.
-2026/10/08-03:23:58.832 9c0 Reusing MANIFEST D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\Session Storage/MANIFEST-000001
+2026/10/10-01:04:47.515 2f80 Creating DB D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\Session Storage since it was missing.
+2026/10/10-01:04:47.586 2f80 Reusing MANIFEST D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\Session Storage/MANIFEST-000001
+2026/10/10-01:14:02.885 3fdc Level-0 table #5: started
+2026/10/10-01:14:02.905 3fdc Level-0 table #5: 19844 bytes OK
+2026/10/10-01:14:02.929 3fdc Delete type=0 #3

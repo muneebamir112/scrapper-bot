@@ -1,3 +1,4 @@
-2026/10/08-03:15:31.115 42f4 Reusing MANIFEST D:\webncodes\scraper\Jobgether\profiles\jobgether_profile\Default\Service Worker\Database/MANIFEST-000001
-2026/10/08-03:15:31.116 42f4 Recovering log #3
-2026/10/08-03:15:31.116 42f4 Reusing old log D:\webncodes\scraper\Jobgether\profiles\jobgether_profile\Default\Service Worker\Database/000003.log 
+2026/10/10-00:58:26.630 45ec Reusing MANIFEST D:\webncodes\scraper\Jobgether\profiles\jobgether_profile\Default\Service Worker\Database/MANIFEST-000001
+2026/10/10-00:58:26.632 45ec Recovering log #3
+2026/10/10-00:58:26.632 45ec (ignoring error) D:\webncodes\scraper\Jobgether\profiles\jobgether_profile\Default\Service Worker\Database/000003.log: dropping 110 bytes; Corruption: missing start of fragmented record(2)
+2026/10/10-00:58:26.633 45ec Reusing old log D:\webncodes\scraper\Jobgether\profiles\jobgether_profile\Default\Service Worker\Database/000003.log 

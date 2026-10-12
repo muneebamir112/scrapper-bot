@@ -1,9 +1,21 @@
-2026/10/08-03:24:00.075 44b8 Reusing MANIFEST D:\webncodes\scraper\GlassD\profiles\glassdoor_profile\Default\Local Storage\leveldb/MANIFEST-000001
-2026/10/08-03:24:00.079 44b8 Recovering log #16
-2026/10/08-03:24:00.081 44b8 Level-0 table #18: started
-2026/10/08-03:24:03.700 44b8 Level-0 table #18: 15412 bytes OK
-2026/10/08-03:24:03.702 44b8 Recovering log #17
-2026/10/08-03:24:03.705 44b8 Reusing old log D:\webncodes\scraper\GlassD\profiles\glassdoor_profile\Default\Local Storage\leveldb/000017.log 
-2026/10/08-03:24:04.132 44b8 Delete type=0 #16
-2026/10/08-03:25:42.365 1f5c Level-0 table #20: started
-2026/10/08-03:25:43.628 1f5c Level-0 table #20: 14297 bytes OK
+2026/10/10-01:04:51.172 4270 Reusing MANIFEST D:\webncodes\scraper\GlassD\profiles\glassdoor_profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/10/10-01:04:51.174 4270 Recovering log #68
+2026/10/10-01:04:51.174 4270 Level-0 table #70: started
+2026/10/10-01:04:51.217 4270 Level-0 table #70: 11754 bytes OK
+2026/10/10-01:04:51.217 4270 Recovering log #69
+2026/10/10-01:04:51.218 4270 Level-0 table #71: started
+2026/10/10-01:04:51.237 4270 Level-0 table #71: 10042 bytes OK
+2026/10/10-01:04:51.258 4270 Delete type=0 #68
+2026/10/10-01:04:51.258 4270 Delete type=0 #69
+2026/10/10-01:06:29.524 47d4 Level-0 table #74: started
+2026/10/10-01:06:29.565 47d4 Level-0 table #74: 16489 bytes OK
+2026/10/10-01:06:29.578 47d4 Delete type=0 #72
+2026/10/10-01:06:29.578 4270 Compacting 4@0 + 1@1 files
+2026/10/10-01:06:29.599 4270 Generated table #75@0: 30 keys, 15476 bytes
+2026/10/10-01:06:29.599 4270 Compacted 4@0 + 1@1 files => 15476 bytes
+2026/10/10-01:06:29.663 4270 compacted to: files[ 0 1 0 0 0 0 0 ]
+2026/10/10-01:06:29.664 4270 Delete type=2 #65
+2026/10/10-01:06:29.665 4270 Delete type=2 #67
+2026/10/10-01:06:29.665 4270 Delete type=2 #70
+2026/10/10-01:06:29.665 4270 Delete type=2 #71
+2026/10/10-01:06:29.665 4270 Delete type=2 #74
