@@ -10,7 +10,8 @@ if not os.environ.get("JOBBOT_LAUNCHER_AUTH"):
     sys.exit(1)
 import asyncio
 import sys
-from urllib.parse import quote
+import time
+from urllib.parse import quote, urlparse
 import pandas as pd
 from patchright.async_api import async_playwright
 import re
@@ -18,6 +19,31 @@ import os
 import gspread
 from google.oauth2.service_account import Credentials
 from datetime import date
+
+TAG = "JG"
+_T0 = time.time()
+STATS = {"cards": 0, "fresh": 0, "dup": 0, "skip": 0, "saved": 0, "bad": 0, "status": "ok"}
+
+
+def log(level, msg):
+    """One log line: [platform] +seconds-since-start LEVEL message (the launcher adds the clock time)."""
+    print(f"[{TAG}] +{time.time() - _T0:5.1f}s {level:<5} {msg}", flush=True)
+
+
+def short(url):
+    """Host + path only, cut to 70 characters. No query string: links can carry tokens."""
+    u = urlparse(str(url))
+    return (u.netloc + u.path)[:70]
+
+
+def jid(link):
+    """Short id of a job link, to follow one job through the log."""
+    return urlparse(str(link)).path.rsplit("/", 1)[-1][:12]
+
+
+def summary():
+    log("SUM", f"status={STATS['status']} cards={STATS['cards']} fresh={STATS['fresh']} dup={STATS['dup']} "
+               f"skip={STATS['skip']} saved={STATS['saved']} bad={STATS['bad']} elapsed={time.time() - _T0:.0f}s")
 
 if getattr(sys, 'frozen', False):
     CURRENT_DIR = os.path.dirname(sys.executable)
@@ -47,7 +73,7 @@ def get_google_sheet():
     if the service account file is missing or the connection fails, so the
     scraper can keep running and just skip the Sheets sync."""
     if not os.path.exists(SERVICE_ACCOUNT_FILE):
-        print(f"  Google Sheets sync disabled: {SERVICE_ACCOUNT_FILE} not found")
+        log("WARN", "Google Sheets sync disabled: service account file not found")
         return None
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -60,7 +86,7 @@ def get_google_sheet():
             worksheet = spreadsheet.add_worksheet(title="Jobs", rows=1000, cols=20)
         return worksheet
     except Exception as e:
-        print(f"  Google Sheets connection failed: {e}")
+        log("WARN", f"Google Sheets connection failed: {e}")
         return None
 
 
@@ -78,7 +104,7 @@ def ensure_header(worksheet):
             })
             worksheet.format("I2:I", {"numberFormat": {"type": "TEXT"}, "wrapStrategy": "CLIP"})
         except Exception as e:
-            print(f"  Could not format headers: {e}")
+            log("WARN", f"could not format headers: {e}")
 
 
 def load_seen_links(worksheet):
@@ -87,7 +113,7 @@ def load_seen_links(worksheet):
     try:
         link_col = worksheet.col_values(6)
     except Exception as e:
-        print(f"  Could not read existing job links from sheet: {e}")
+        log("WARN", f"could not read existing job links from the sheet: {e}")
         return set()
     return {v.strip() for v in link_col[1:] if v.strip()}
 
@@ -102,7 +128,7 @@ def load_seen_jobs(worksheet):
         company_col = worksheet.col_values(2)
         title_col = worksheet.col_values(3)
     except Exception as e:
-        print(f"  Could not read existing company/job-title pairs from sheet: {e}")
+        log("WARN", f"could not read existing company/title pairs from the sheet: {e}")
         return set()
     seen = set()
     for company, title in zip(company_col[1:], title_col[1:]):
@@ -138,8 +164,6 @@ def make_link_formula(url):
 
 import html as _html
 import json
-import time
-from urllib.parse import urlparse
 
 
 EMPTY_VALUES = {"", "n/a", "na", "unknown", "none", "null", "-", "undefined"}
@@ -246,26 +270,38 @@ def append_job(sheet, job, seen_links, seen_jobs):
     Returns True if the row was written."""
     link = str(job.get("link") or "").strip()
     key = (str(job.get("company") or "").strip().lower(), str(job.get("title") or "").strip().lower())
-    if not link or link in seen_links or (key[0] and key[1] and key in seen_jobs):
+    who = f"{job.get('company', '')} | {job.get('title', '')}"
+    if not link:
+        STATS["skip"] += 1
+        log("SKIP", f"{who}: no apply link")
+        return False
+    if link in seen_links or (key[0] and key[1] and key in seen_jobs):
+        STATS["dup"] += 1
+        log("DUP", f"{who}: {'link' if link in seen_links else 'company+title'} already in the sheet (at write)")
         return False
     problem = row_problem(job)
     if problem:
-        print(f"  Skipped '{job.get('title', '')}' @ {job.get('company', '')}: {problem}")
+        STATS["skip"] += 1
+        log("SKIP", f"{who}: {problem}")
         return False
+    description = clean_description(job.get("description", ""))
     row = [
         "=ROW()-1", job["company"], job["title"], job["location"], job["age"],
         make_link_formula(link), date.today().strftime("%m/%d/%Y"), job["platform"],
-        clean_description(job.get("description", "")),
+        description,
     ]
     for attempt in range(3):
         try:
             sheet.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
             seen_links.add(link)
             seen_jobs.add(key)
+            STATS["saved"] += 1
+            log("SAVE", f"saved {who} -> {short(link)} (description {len(description)} chars)")
             return True
         except Exception as e:
             if attempt == 2:
-                print(f"  Google Sheets sync failed for '{job.get('title', '')}': {e}")
+                STATS["bad"] += 1
+                log("ERR", f"{who}: could not write the row to the sheet ({str(e)[:120]})")
             else:
                 time.sleep(2)
     return False
@@ -309,6 +345,25 @@ def is_within_24h(age_text):
     if unit.startswith("d"):
         return value <= 1
     return unit.startswith("m") or value <= 24
+
+
+JOB_CONCURRENCY = 3  # offer pages opened at once
+
+
+def connect_sheet():
+    """Sheet connection plus the duplicate-check lists (runs in a thread while the search page loads)."""
+    t0 = time.time()
+    try:
+        sheet = get_google_sheet()
+        if sheet:
+            ensure_header(sheet)
+        seen_links = load_seen_links(sheet) if sheet else set()
+        seen_jobs = load_seen_jobs(sheet) if sheet else set()
+        log("INFO", f"phase=sheet connected in {time.time() - t0:.1f}s")
+        return sheet, seen_links, seen_jobs
+    except Exception as e:
+        log("WARN", f"Google Sheets connection failed: {e}")
+        return None, set(), set()
 
 
 async def main():
@@ -360,22 +415,52 @@ async def main():
             page = context.pages[0]
         else:
             page = await context.new_page()
+        sheet_task = asyncio.create_task(asyncio.to_thread(connect_sheet))
 
         for attempt in range(4):
             try:
-                print("  Clearing local storage to prevent default saved modes...")
+                log("INFO", f"phase=search keyword='{keyword}' location='{location_slug}' remote=True")
                 await page.goto("https://jobgether.com/", timeout=60000)
                 await page.evaluate("window.localStorage.clear(); window.sessionStorage.clear();")
-                await page.wait_for_timeout(1000)
 
-                await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(4000)
+                # Wait for the cards themselves (not a fixed sleep), then until the card count stops changing.
+                # No cards after one retry is reported as a bot-check or as an empty result, not as a silent success.
+                for look in range(2):
+                    await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                    try:
+                        await page.wait_for_selector('a[href^="/offer/"]', timeout=15000)
+                        break
+                    except Exception:
+                        if look == 0:
+                            log("WARN", "no job cards yet, loading the search page once more")
+                            continue
+                        try:
+                            text = (await page.title()) + " " + (await page.inner_text("body"))[:500]
+                        except Exception:
+                            text = ""
+                        if looks_like_captcha(page.url, text):
+                            STATS["status"] = "BOTCHECK"
+                            log("WARN", "the search page shows a bot-check; not trying to get past it")
+                        else:
+                            log("WARN", "the search page has no job cards")
+                last, stable = -1, 0
+                for _ in range(20):
+                    n = await page.locator('a[href^="/offer/"]').count()
+                    stable = stable + 1 if n == last else 0
+                    if stable >= 2:
+                        break
+                    last = n
+                    await page.wait_for_timeout(250)
                 break
             except Exception as e:
                 if attempt == 3:
-                    print("Network error: Could not reach jobgether.com after multiple attempts. Please check your internet connection.")
+                    log("ERR", "network error: could not reach jobgether.com after multiple attempts")
+                    STATS["bad"] += 1
+                    STATS["status"] = "FAILED"
+                    summary()
+                    sheet_task.cancel()
                     return
-                print(f"Network hiccup reaching jobgether.com, retrying ({attempt + 1}/3)...")
+                log("WARN", f"network hiccup reaching jobgether.com, retrying ({attempt + 1}/3)")
                 await asyncio.sleep(2)
 
         try:
@@ -420,7 +505,8 @@ async def main():
                 }
                 return out;
             }""")
-            print(f"Found {len(cards)} job cards")
+            STATS["cards"] = len(cards)
+            log("INFO", f"phase=collect {len(cards)} cards read")
 
             # Cards are sorted newest-first (sort=date), so the first one
             # older than 24h means everything after it is too - no need to
@@ -431,27 +517,30 @@ async def main():
                     fresh_cards.append(c)
                 else:
                     break
-            print(f"{len(fresh_cards)} job(s) posted within the last 24 hours")
+            STATS["fresh"] = len(fresh_cards)
+            log("INFO", f"{len(fresh_cards)} fresh (24h) of {len(cards)} cards")
 
-            # Connect once, before extraction starts, so each job below can
-            # be written to the sheet as soon as it's scraped rather than
-            # waiting to batch-sync the whole list at the end.
-            sheet = get_google_sheet()
-            if sheet:
-                ensure_header(sheet)
-            seen_links = load_seen_links(sheet) if sheet else set()
-            seen_jobs = load_seen_jobs(sheet) if sheet else set()
-            print(f"  Loaded {len(seen_links)} existing job links and {len(seen_jobs)} company/title pairs for duplicate check")
+            # The sheet connection was started while the search page loaded.
+            try:
+                sheet, seen_links, seen_jobs = await sheet_task
+            except Exception as e:
+                log("WARN", f"Google Sheets connection failed: {e}")
+                sheet, seen_links, seen_jobs = None, set(), set()
+            log("INFO", f"duplicate check loaded: {len(seen_links)} links, {len(seen_jobs)} company/title pairs")
 
-            sem = asyncio.Semaphore(2)
+            sem = asyncio.Semaphore(JOB_CONCURRENCY)
+            write_lock = asyncio.Lock()
 
-            async def process(i, card):
+            async def process(card):
                 async with sem:
                     # Already in the sheet (same company + title)? Skip before opening the offer page.
                     key = (card["company"].strip().lower(), card["title"].strip().lower())
                     if key[0] and key[1] and key in seen_jobs:
+                        STATS["dup"] += 1
+                        log("DUP", f"{jid(card['href'])}  {card['company']} | {card['title']}: company+title already in the sheet (before opening the page)")
                         return
                     job_page = None
+                    job_start = time.time()
                     try:
                         full_url = "https://jobgether.com" + card["href"]
                         job_page = await context.new_page()
@@ -473,13 +562,16 @@ async def main():
 
                         description = await read_description(job_page) if apply_link else ""
 
+                        who = f"{jid(card['href'])}  {card['company']} | {card['title']}"
                         if apply_link and looks_like_captcha(apply_link, ""):
-                            print(f"  [{i}] Skipped: apply link looks like a CAPTCHA gate")
+                            STATS["skip"] += 1
+                            log("SKIP", f"{who}: apply link looks like a bot-check page")
                             apply_link = None
                         elif not apply_link:
-                            print(f"  [{i}] Skipped: could not find apply link on page")
+                            STATS["skip"] += 1
+                            log("SKIP", f"{who}: could not find the apply link on the page")
                         else:
-                            print(f"  [{i}] Saving job: {apply_link}")
+                            log("JOB", f"{who}: apply link found, read in {time.time() - job_start:.1f}s")
 
                         if apply_link:
                             job_data = {
@@ -491,13 +583,18 @@ async def main():
                             }
                             results.append(job_data)
                             if sheet:
-                                append_job(sheet, {
-                                    "company": card["company"], "title": card["title"], "location": "United States",
-                                    "age": card["posted"], "link": apply_link, "platform": "Jobgether",
-                                    "description": description,
-                                }, seen_links, seen_jobs)
+                                # one write at a time: the duplicate check, the append and the seen_* update stay together
+                                async with write_lock:
+                                    await asyncio.to_thread(append_job, sheet, {
+                                        "company": card["company"], "title": card["title"], "location": "United States",
+                                        "age": card["posted"], "link": apply_link, "platform": "Jobgether",
+                                        "description": description,
+                                    }, seen_links, seen_jobs)
+                            else:
+                                log("WARN", f"{who}: sheet not connected; only in jobgether.xlsx")
                     except Exception as e:
-                        print(f"  Error processing job: {e}")
+                        STATS["bad"] += 1
+                        log("ERR", f"{jid(card['href'])}  error while processing the job: {str(e)[:150]}")
                     finally:
                         if job_page is not None:
                             try:
@@ -505,8 +602,8 @@ async def main():
                             except Exception:
                                 pass
 
-            print(f"  Processing {len(fresh_cards)} job(s), 2 at a time...")
-            await asyncio.gather(*(process(i, c) for i, c in enumerate(fresh_cards, start=1)), return_exceptions=True)
+            log("INFO", f"phase=extract {len(fresh_cards)} jobs, {JOB_CONCURRENCY} at a time")
+            await asyncio.gather(*(process(c) for c in fresh_cards), return_exceptions=True)
 
             # Save to Excel - one fixed filename overwritten each run (same
             # as Glassdoor's glassdoor.xlsx and Hiring Cafe's jobs.xlsx),
@@ -517,10 +614,17 @@ async def main():
             df = pd.DataFrame(results)
             excel_file = "jobgether.xlsx"
             df.to_excel(excel_file, index=False)
-            print(f"\nSaved {len(results)} jobs to {excel_file}")
+            log("INFO", f"done: {STATS['saved']} rows written to the sheet, {len(results)} jobs in {excel_file}")
+            summary()
 
         finally:
             await context.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except Exception as e:
+        log("ERR", f"fatal: {str(e)[:200]}")
+        STATS["status"] = "FAILED"
+        summary()
+        raise
