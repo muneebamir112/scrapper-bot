@@ -8,8 +8,12 @@ import sys
 import os
 import sys
 if not os.environ.get("JOBBOT_LAUNCHER_AUTH"):
-    import ctypes
-    ctypes.windll.user32.MessageBoxW(0, "Access Denied: This module must be run from the Job Bot Launcher.", "Security Alert", 0x10)
+    msg = "Access Denied: This module must be run from the Job Bot Launcher."
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, msg, "Security Alert", 0x10)
+    else:
+        print(msg)
     sys.exit(1)
 import sys
 import re
@@ -52,34 +56,22 @@ def get_google_sheet():
         print(f"  Google Sheets connection failed: {e}")
         return None
 
-def find_next_sheet_slot(worksheet):
-    """Finds the first empty row by looking for empty cells in the Company column (B).
-    If the sheet is completely empty, it writes the headers to row 1."""
-    company_col = worksheet.col_values(2)  # column B
-    
+def ensure_header(worksheet):
+    """Create the header row if the tab is empty (column I holds the job description)."""
+    company_col = worksheet.col_values(2)
     if len(company_col) == 0 or (len(company_col) == 1 and not company_col[0].strip()):
-        # Sheet is completely empty (or missing column B). Write headers!
-        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform"]
-        worksheet.update(range_name="A1:H1", values=[headers], value_input_option="USER_ENTERED")
-        
-        # Format headers to match the user's yellow, bold, centered style
+        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform", "Job Description"]
+        worksheet.update(range_name="A1:I1", values=[headers], value_input_option="USER_ENTERED")
         try:
-            worksheet.format("A1:H1", {
+            worksheet.format("A1:I1", {
                 "backgroundColor": {"red": 0.99, "green": 0.89, "blue": 0.58},
                 "textFormat": {"bold": True, "fontSize": 10},
                 "horizontalAlignment": "CENTER",
             })
+            worksheet.format("I2:I", {"numberFormat": {"type": "TEXT"}, "wrapStrategy": "CLIP"})
         except Exception as e:
             print(f"  Could not format headers: {e}")
-        return 2, 1
-        
-    next_row = len(company_col) + 1
-    for i in range(1, len(company_col)):
-        if not company_col[i].strip():
-            next_row = i + 1
-            break
-            
-    return next_row, next_row - 1
+
 
 def load_seen_links(worksheet):
     """Application links already logged in the Google Sheet (column F, 'Job Link').
@@ -154,37 +146,35 @@ def looks_like_captcha(url, page_text):
     haystack = f"{url} {page_text}".lower()
     return any(indicator in haystack for indicator in CAPTCHA_INDICATORS)
 
-def _wait_for_real_navigation(page, timeout_ms=8000):
-    """A newly opened tab sits on about:blank for a moment until its actual
-    navigation lands - waiting a fixed delay and then reading page.url risks
-    reading it while it's still blank (which was ending up as the captured
-    application link). Wait for the URL to actually change instead."""
+def _click_and_follow(context, job_page, el):
+    """Click el and return the page to read next: the new tab the click opened (the old page is
+    closed), or job_page if the same tab navigated. Waits up to 15 s for the URL to leave glassdoor.com."""
+    new_tab = None
     try:
-        page.wait_for_url(lambda url: url != "about:blank", timeout=timeout_ms)
+        with context.expect_page(timeout=15000) as info:
+            el.click()
+            # Glassdoor may first ask the user to update job preferences; "Skip for now" dismisses
+            # that prompt and the apply continues.
+            try:
+                skip = job_page.wait_for_selector("button:has-text('Skip for now')", timeout=4000)
+                if skip and skip.is_visible():
+                    skip.click()
+            except TimeoutError:
+                pass
+        new_tab = info.value
     except TimeoutError:
-        pass
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=2000)
-    except Exception:
-        pass
-
-
-def _switch_to_new_tab(context, current_page):
-    """If a click just opened a new tab (e.g. an employer/Indeed apply flow
-    breaking out of Glassdoor's own job-detail tab), close the now-stale
-    current_page and return the new tab; otherwise return current_page
-    unchanged. Without this, the old tab - often left sitting on an Indeed
-    CAPTCHA/verification page - stays open for the rest of the run."""
-    pages = context.pages
-    if len(pages) > 1 and pages[-1] != current_page:
-        new_page = pages[-1]
+        pass  # no new tab: the same page navigated (or nothing happened)
+    if new_tab is not None:
         try:
-            current_page.close()
+            job_page.close()
         except Exception:
             pass
-        _wait_for_real_navigation(new_page)
-        return new_page
-    return current_page
+        job_page = new_tab
+    try:
+        job_page.wait_for_url(lambda u: u != "about:blank" and "glassdoor.com" not in u, timeout=15000)
+    except TimeoutError:
+        pass
+    return job_page
 
 
 def make_link_formula(url):
@@ -193,6 +183,169 @@ def make_link_formula(url):
     plain URL text, so nothing downstream that reads the sheet is affected)."""
     escaped = url.replace('"', '""')
     return f'=HYPERLINK("{escaped}", "{escaped}")'
+
+import html as _html
+import json
+import time
+from urllib.parse import urlparse
+
+
+def is_within_24h(age_text):
+    """Strict check of a 'posted X ago' text: only hours, minutes, 'today' and 'just now'
+    count. Days, weeks, months and unrecognised text do not ('1d ago' can be ~47 h old)."""
+    text = str(age_text or "").lower().strip()
+    if not text:
+        return False
+    if "just now" in text or "today" in text or text == "now":
+        return True
+    match = re.search(r"(\d+)\+?\s*(h|hrs?|hours?|m|mins?|minutes?)\b", text)
+    if not match:
+        return False
+    return match.group(2).startswith("m") or int(match.group(1)) <= 24
+
+
+EMPTY_VALUES = {"", "n/a", "na", "unknown", "none", "null", "-", "undefined"}
+BOARD_HOSTS = ("glassdoor.com", "hiring.cafe", "hiringcafe.com", "jobgether.com")
+
+# Job-description capture: the page's JSON-LD first, then the largest block of readable text.
+JSONLD_JS = """() => Array.from(document.querySelectorAll('script[type="application/ld+json"]')).map(s => s.textContent)"""
+BLOCK_JS = """() => {
+  const groups = ['[class*="description" i], [id*="description" i], [class*="job-details" i], [class*="jobdetail" i]', 'article', 'main, [role="main"]'];
+  for (const g of groups) {
+    let best = '';
+    for (const el of document.querySelectorAll(g)) {
+      const t = (el.innerText || '').trim();
+      if (t.length > best.length && t.length < 60000) best = t;
+    }
+    if (best.length >= 400) return best;
+  }
+  return document.body ? document.body.innerText : '';
+}"""
+
+
+def html_to_text(raw):
+    s = re.sub(r"<(script|style)\b.*?</\1>", " ", str(raw), flags=re.I | re.S)
+    s = re.sub(r"<li\b[^>]*>", "\n- ", s, flags=re.I)
+    s = re.sub(r"</?(p|div|br|ul|ol|h[1-6]|tr|section)\b[^>]*>", "\n", s, flags=re.I)
+    return _html.unescape(re.sub(r"<[^>]+>", "", s))
+
+
+def description_from_jsonld(raws):
+    """Description of a schema.org JobPosting found in the page's JSON-LD blocks, as text."""
+    def find(node):
+        if isinstance(node, list):
+            for item in node:
+                found = find(item)
+                if found:
+                    return found
+        elif isinstance(node, dict):
+            kind = node.get("@type")
+            if (kind == "JobPosting" or (isinstance(kind, list) and "JobPosting" in kind)) and isinstance(node.get("description"), str):
+                return node["description"]
+            for value in node.values():
+                if isinstance(value, (list, dict)):
+                    found = find(value)
+                    if found:
+                        return found
+        return None
+
+    for raw in raws or []:
+        try:
+            found = find(json.loads(raw))
+        except Exception:
+            continue
+        if found:
+            return html_to_text(found)
+    return ""
+
+
+def clean_description(text):
+    """Make a description safe for one sheet cell: no control characters, tidy lines,
+    capped at 20,000 characters, never starting with a character Sheets reads as a formula."""
+    if not text:
+        return ""
+    s = str(text).replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ")
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200b\u200c\u200d\u2060\ufeff]", "", s)
+    s = "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in s.split("\n"))
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    if len(s) > 20000:
+        s = s[:20000].rstrip() + "\n... [truncated]"
+    if s[:1] in ("=", "+", "-", "@"):
+        s = " " + s
+    return s
+
+
+def pick_description(candidates):
+    """First candidate with at least 400 characters, else the longest non-empty one."""
+    texts = [t for t in (clean_description(c) for c in candidates if c) if t]
+    for t in texts:
+        if len(t) >= 400:
+            return t
+    return max(texts, key=len) if texts else ""
+
+
+def row_problem(job):
+    """Why this job must not be written to the sheet, or '' if it is complete."""
+    for field in ("company", "title", "location", "age", "link"):
+        if str(job.get(field) or "").strip().lower() in EMPTY_VALUES:
+            return f"missing {field}"
+    link = str(job["link"]).strip()
+    if not link.lower().startswith(("http://", "https://")):
+        return "apply link is not an http(s) URL"
+    host = (urlparse(link).netloc or "").lower()
+    if any(host == h or host.endswith("." + h) for h in BOARD_HOSTS):
+        return f"apply link is still on the job board ({host})"
+    if looks_like_captcha(link, ""):
+        return "apply link looks like a bot-check page"
+    if not is_within_24h(job["age"]):
+        return f"not posted within 24h ('{job['age']}')"
+    return ""
+
+
+def append_job(sheet, job, seen_links, seen_jobs):
+    """Append one job to the sheet. Google picks the next free row, so scrapers running
+    at the same time cannot overwrite each other. Skips duplicates and incomplete jobs.
+    Returns True if the row was written."""
+    link = str(job.get("link") or "").strip()
+    key = (str(job.get("company") or "").strip().lower(), str(job.get("title") or "").strip().lower())
+    if not link or link in seen_links or (key[0] and key[1] and key in seen_jobs):
+        return False
+    problem = row_problem(job)
+    if problem:
+        print(f"  Skipped '{job.get('title', '')}' @ {job.get('company', '')}: {problem}")
+        return False
+    row = [
+        "=ROW()-1", job["company"], job["title"], job["location"], job["age"],
+        make_link_formula(link), date.today().strftime("%m/%d/%Y"), job["platform"],
+        clean_description(job.get("description", "")),
+    ]
+    for attempt in range(3):
+        try:
+            sheet.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
+            seen_links.add(link)
+            seen_jobs.add(key)
+            return True
+        except Exception as e:
+            if attempt == 2:
+                print(f"  Google Sheets sync failed for '{job.get('title', '')}': {e}")
+            else:
+                time.sleep(2)
+    return False
+
+
+def read_description(page):
+    """Description text of the page that is open: JSON-LD first, then the main text block."""
+    candidates = []
+    try:
+        candidates.append(description_from_jsonld(page.evaluate(JSONLD_JS)))
+    except Exception:
+        pass
+    try:
+        candidates.append(page.evaluate(BLOCK_JS))
+    except Exception:
+        pass
+    return pick_description(candidates)
+
 
 def main():
     # For testing: limit number of jobs processed (set to None for unlimited)
@@ -222,7 +375,8 @@ def main():
 
     # Connect to Google Sheets (jobs are pushed there live, row by row, as they're scraped)
     sheet = get_google_sheet()
-    sheet_next_row, sheet_next_no = find_next_sheet_slot(sheet) if sheet else (None, None)
+    if sheet:
+        ensure_header(sheet)
     seen_links = load_seen_links(sheet) if sheet else set()
     seen_jobs = load_seen_jobs(sheet) if sheet else set()
     print(f"  Loaded {len(seen_links)} existing job links and {len(seen_jobs)} company/title pairs for duplicate check")
@@ -326,6 +480,10 @@ def main():
             except TimeoutError:
                 print("  Remote button not found")
 
+            if "remoteWorkType=1" not in page.url:
+                print("  WARNING: the Remote filter did not apply (remoteWorkType=1 is missing from the address); stopping so no on-site jobs are saved.")
+                return
+
             # Step 5b: Apply Glassdoor's own "Date posted: Last day" filter via
             # its fromAge=1 URL param, instead of loading every listing (most
             # of which are >24h old) and filtering them out client-side after
@@ -338,6 +496,10 @@ def main():
                 page.wait_for_timeout(2000)
             except Exception as e:
                 print(f"  Could not apply date filter, falling back to client-side filtering only: {e}")
+
+            date_filter_on = "fromAge=1" in page.url
+            if not date_filter_on:
+                print("  WARNING: the 'last day' filter is not in the address; jobs without a readable age will be skipped.")
 
             # Step 6: Load all jobs by clicking "Show more jobs" or scrolling
             max_load_attempts = 50
@@ -394,6 +556,7 @@ def main():
                 try:
                     # Skip Easy Apply
                     if card.query_selector("[data-test='easy-apply'], .easy-apply, div:has-text('Easy Apply')"):
+                        print(f"  [{idx}] Skipped: Easy Apply (no employer link)")
                         continue
 
                     # Extract job age and filter (skip if older than 24 hours)
@@ -403,13 +566,19 @@ def main():
                     if age_el:
                         job_age = age_el.inner_text().strip()
                         age_days = parse_job_age(job_age)
-                    
+
+                    # The cards show no posting age; the last-day filter (fromAge=1) is on, so say so explicitly.
+                    if job_age == "N/A" and date_filter_on:
+                        job_age = "Within 24h"
+
                     if age_days > 1:
+                        print(f"  [{idx}] Skipped: older than 24h ({job_age})")
                         continue
 
                     # Get job URL
                     link = card.query_selector("a[data-test='job-link'], a[href*='job/']")
                     if not link:
+                        print(f"  [{idx}] Skipped: no job link on the card")
                         continue
 
                     job_url = link.get_attribute("href")
@@ -453,11 +622,14 @@ def main():
                         except TimeoutError:
                             continue
                     
+                    description = read_description(job_page)
+
                     # Same job already in the sheet from another platform (or
                     # earlier in this run)? Skip before spending time on the
                     # Apply-click flow below.
                     job_key = (company.strip().lower(), job_t.strip().lower())
                     if job_key in seen_jobs:
+                        print(f"  [{idx}] Skipped: already in the sheet ({company} / {job_t})")
                         job_page.close()
                         continue
 
@@ -472,38 +644,26 @@ def main():
                         try:
                             el = job_page.wait_for_selector(sel, timeout=4000)
                             if el and el.is_visible():
-                                el.click()
                                 applied = True
-                                job_page.wait_for_timeout(3000)
-                                # This click sometimes opens the employer's/Indeed's
-                                # apply page in a new tab rather than navigating
-                                # job_page itself - switch to it and close the old
-                                # tab so it doesn't sit open (often on an Indeed
-                                # CAPTCHA/verification page) for the rest of the run.
-                                job_page = _switch_to_new_tab(context, job_page)
+                                job_page = _click_and_follow(context, job_page, el)
                                 break
                         except TimeoutError:
                             continue
 
                     if not applied:
+                        print(f"  [{idx}] Skipped: no 'Apply on employer site' button")
                         job_page.close()
                         continue
 
                     # Click Start Application if present
-                    for sel in [
-                        "button:has-text('Start my application')",
-                        "[data-test='start-application-button']",
-                        "button:has-text('Start application')"
-                    ]:
-                        try:
-                            el = job_page.wait_for_selector(sel, timeout=3000)
-                            if el and el.is_visible():
-                                el.click()
-                                job_page.wait_for_timeout(10000)
-                                job_page = _switch_to_new_tab(context, job_page)
-                                break
-                        except TimeoutError:
-                            pass
+                    try:
+                        el = job_page.wait_for_selector(
+                            "button:has-text('Start my application'), [data-test='start-application-button'], button:has-text('Start application')",
+                            timeout=3000)
+                        if el and el.is_visible():
+                            job_page = _click_and_follow(context, job_page, el)
+                    except TimeoutError:
+                        pass
 
                     app_url = job_page.url.strip()
                     if not app_url or app_url == "about:blank":
@@ -532,36 +692,28 @@ def main():
                     # leaving Glassdoor - not a page the applicant can actually
                     # submit an application from, so it doesn't count as
                     # ready-to-apply either.
-                    # if "glassdoor.com" in app_url:
-                    #     print(f"  [{idx}] Skipped: still on Glassdoor, never reached the employer's application page")
-                    #     job_page.close()
-                    #     continue
+                    if "glassdoor.com" in app_url:
+                        print(f"  [{idx}] Skipped: still on Glassdoor, never reached the employer's application page ({app_url[:120]})")
+                        job_page.close()
+                        continue
 
                     # Duplicate check: skip only if this exact application link was
                     # already added (in this run or a past one). Multiple postings from
                     # the same company are fine as long as each has its own link.
                     if app_url in seen_links:
+                        print(f"  [{idx}] Skipped: this application link is already in the sheet")
                         job_page.close()
                         continue
 
-                    ws.append([company, job_t, loc, job_age, app_url])
-                    seen_links.add(app_url)
-                    seen_jobs.add(job_key)
-
+                    saved = True
                     if sheet:
-                        try:
-                            sheet_row = [
-                                str(sheet_next_no), company, job_t, loc, job_age,
-                                make_link_formula(app_url), date.today().strftime("%m/%d/%Y"),
-                                "Glassdoor",
-                            ]
-                            sheet.update(range_name=f"A{sheet_next_row}:H{sheet_next_row}", values=[sheet_row], value_input_option="USER_ENTERED")
-                            sheet_next_row += 1
-                            sheet_next_no += 1
-                        except Exception as e:
-                            print(f"  [{idx}] Google Sheets sync failed: {e}")
-
-                    processed += 1
+                        saved = append_job(sheet, {
+                            "company": company, "title": job_t, "location": loc, "age": job_age,
+                            "link": app_url, "platform": "Glassdoor", "description": description,
+                        }, seen_links, seen_jobs)
+                    if saved:
+                        ws.append([company, job_t, loc, job_age, app_url])
+                        processed += 1
                     job_page.close()
                     
                     # Test mode limit

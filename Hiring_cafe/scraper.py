@@ -1,8 +1,12 @@
 import os
 import sys
 if not os.environ.get("JOBBOT_LAUNCHER_AUTH"):
-    import ctypes
-    ctypes.windll.user32.MessageBoxW(0, "Access Denied: This module must be run from the Job Bot Launcher.", "Security Alert", 0x10)
+    msg = "Access Denied: This module must be run from the Job Bot Launcher."
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, msg, "Security Alert", 0x10)
+    else:
+        print(msg)
     sys.exit(1)
 import asyncio
 import re
@@ -61,40 +65,21 @@ def get_google_sheet():
         return None
 
 
-def find_next_sheet_slot(worksheet):
+def ensure_header(worksheet):
+    """Create the header row if the tab is empty (column I holds the job description)."""
     company_col = worksheet.col_values(2)
-    
     if len(company_col) == 0 or (len(company_col) == 1 and not company_col[0].strip()):
-        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform"]
-        worksheet.update(range_name="A1:H1", values=[headers], value_input_option="USER_ENTERED")
-        
-        # Format headers to match the user's yellow, bold, centered style
+        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform", "Job Description"]
+        worksheet.update(range_name="A1:I1", values=[headers], value_input_option="USER_ENTERED")
         try:
-            worksheet.format("A1:H1", {
+            worksheet.format("A1:I1", {
                 "backgroundColor": {"red": 0.99, "green": 0.89, "blue": 0.58},
                 "textFormat": {"bold": True, "fontSize": 10},
                 "horizontalAlignment": "CENTER",
             })
+            worksheet.format("I2:I", {"numberFormat": {"type": "TEXT"}, "wrapStrategy": "CLIP"})
         except Exception as e:
             print(f"  Could not format headers: {e}")
-        return 2, 1
-        
-    next_row = len(company_col) + 1
-    for i in range(1, len(company_col)):
-        if not company_col[i].strip():
-            next_row = i + 1
-            break
-            
-    try:
-        no_col = worksheet.col_values(1)
-        if next_row - 1 < len(no_col) and no_col[next_row - 1].isdigit():
-            next_no = int(no_col[next_row - 1]) + 1
-        else:
-            next_no = max([int(x) for x in no_col[1:] if x.isdigit()] + [0]) + 1
-    except:
-        next_no = 1
-        
-    return next_row, next_no
 
 
 def load_seen_links(worksheet):
@@ -130,31 +115,17 @@ def load_seen_jobs(worksheet):
 
 
 def is_within_24h(age_text):
-    """Best-effort check of a 'posted X ago' style string. Hour/minute
-    granularity is always within 24h; day/week/month granularity is not
-    (except '0 days ago'). Unrecognized/empty text is treated as within 24h
-    rather than silently dropping a job we can't confidently place."""
-    if not age_text:
+    """Strict check of a 'posted X ago' text: only hours, minutes, 'today' and 'just now'
+    count. Days, weeks, months and unrecognised text do not ('1d ago' can be ~47 h old)."""
+    text = str(age_text or "").lower().strip()
+    if not text:
         return False
-    text = age_text.lower().strip()
-    if "just" in text or "today" in text or "now" in text:
+    if "just now" in text or "today" in text or text == "now":
         return True
-    # hiring.cafe's own "Posted X ago" text uses abbreviated units (1w, 4d,
-    # 2mo, 5h) rather than full words, which this pattern didn't recognize
-    # before - every such age fell through to the "unrecognized" default of
-    # True, silently letting week/month-old postings past the 24h filter.
-    match = re.search(r'(\d+)\s*(mo|months?|w|weeks?|d|days?|h|hrs?|hours?|m|mins?|minutes?)\b', text)
+    match = re.search(r"(\d+)\+?\s*(h|hrs?|hours?|m|mins?|minutes?)\b", text)
     if not match:
-        return True
-    value = int(match.group(1))
-    unit = match.group(2)
-    if unit in ("h", "hr", "hrs", "hour", "hours"):
-        return value <= 24
-    if unit in ("m", "min", "mins", "minute", "minutes"):
-        return True
-    if unit in ("d", "day", "days"):
-        return value <= 1
-    return False  # week/month
+        return False
+    return match.group(2).startswith("m") or int(match.group(1)) <= 24
 
 
 CAPTCHA_INDICATORS = [
@@ -188,6 +159,26 @@ async def _wait_for_real_navigation(page, timeout_ms=8000):
         pass
 
 
+async def _wait_for_links_to_settle(page, max_ms=3000, step_ms=500):
+    """Wait until the number of job links on the page stops changing, so a partly rendered page is never read."""
+    last = -1
+    for _ in range(max_ms // step_ms):
+        count = await page.locator('a[href^="/job/"]').count()
+        if count == last:
+            return
+        last = count
+        await page.wait_for_timeout(step_ms)
+
+
+# Clicks the first "Apply" button (not "Applied"); returns whether one was found.
+APPLY_CLICK_JS = """() => {
+    for (const btn of document.querySelectorAll('button')) {
+        if (btn.textContent && /Apply(?!ed)/.test(btn.textContent)) { btn.click(); return true; }
+    }
+    return false;
+}"""
+
+
 def make_link_formula(url):
     """Wrap a URL in a HYPERLINK() formula so it renders as a clickable link
     in the sheet (gspread's default FORMATTED_VALUE reads still return the
@@ -196,33 +187,153 @@ def make_link_formula(url):
     return f'=HYPERLINK("{escaped}", "{escaped}")'
 
 
-def sync_one_job_to_sheet(sheet, job, seen_links, seen_jobs, next_row, next_no):
-    """Write a single job to the next open sheet row right after it's
-    extracted, instead of waiting to batch-sync the whole list at the end -
-    that way jobs already found survive even if a later job or the browser
-    itself crashes mid-run. Returns the (possibly advanced) next_row/next_no
-    for the following call."""
-    link = (job.get("apply_link") or job.get("job_url") or "").strip()
-    if not link or link in seen_links:
-        return next_row, next_no
-    company = (job.get("company") or "").strip().lower()
-    title = (job.get("title") or "").strip().lower()
-    job_key = (company, title)
-    if company and title and job_key in seen_jobs:
-        return next_row, next_no
+import html as _html
+import json
+import time
+from urllib.parse import urlparse
+
+
+EMPTY_VALUES = {"", "n/a", "na", "unknown", "none", "null", "-", "undefined"}
+BOARD_HOSTS = ("glassdoor.com", "hiring.cafe", "hiringcafe.com", "jobgether.com")
+
+# Job-description capture: the page's JSON-LD first, then the largest block of readable text.
+JSONLD_JS = """() => Array.from(document.querySelectorAll('script[type="application/ld+json"]')).map(s => s.textContent)"""
+BLOCK_JS = """() => {
+  const groups = ['[class*="description" i], [id*="description" i], [class*="job-details" i], [class*="jobdetail" i]', 'article', 'main, [role="main"]'];
+  for (const g of groups) {
+    let best = '';
+    for (const el of document.querySelectorAll(g)) {
+      const t = (el.innerText || '').trim();
+      if (t.length > best.length && t.length < 60000) best = t;
+    }
+    if (best.length >= 400) return best;
+  }
+  return document.body ? document.body.innerText : '';
+}"""
+
+
+def html_to_text(raw):
+    s = re.sub(r"<(script|style)\b.*?</\1>", " ", str(raw), flags=re.I | re.S)
+    s = re.sub(r"<li\b[^>]*>", "\n- ", s, flags=re.I)
+    s = re.sub(r"</?(p|div|br|ul|ol|h[1-6]|tr|section)\b[^>]*>", "\n", s, flags=re.I)
+    return _html.unescape(re.sub(r"<[^>]+>", "", s))
+
+
+def description_from_jsonld(raws):
+    """Description of a schema.org JobPosting found in the page's JSON-LD blocks, as text."""
+    def find(node):
+        if isinstance(node, list):
+            for item in node:
+                found = find(item)
+                if found:
+                    return found
+        elif isinstance(node, dict):
+            kind = node.get("@type")
+            if (kind == "JobPosting" or (isinstance(kind, list) and "JobPosting" in kind)) and isinstance(node.get("description"), str):
+                return node["description"]
+            for value in node.values():
+                if isinstance(value, (list, dict)):
+                    found = find(value)
+                    if found:
+                        return found
+        return None
+
+    for raw in raws or []:
+        try:
+            found = find(json.loads(raw))
+        except Exception:
+            continue
+        if found:
+            return html_to_text(found)
+    return ""
+
+
+def clean_description(text):
+    """Make a description safe for one sheet cell: no control characters, tidy lines,
+    capped at 20,000 characters, never starting with a character Sheets reads as a formula."""
+    if not text:
+        return ""
+    s = str(text).replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ")
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200b\u200c\u200d\u2060\ufeff]", "", s)
+    s = "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in s.split("\n"))
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    if len(s) > 20000:
+        s = s[:20000].rstrip() + "\n... [truncated]"
+    if s[:1] in ("=", "+", "-", "@"):
+        s = " " + s
+    return s
+
+
+def pick_description(candidates):
+    """First candidate with at least 400 characters, else the longest non-empty one."""
+    texts = [t for t in (clean_description(c) for c in candidates if c) if t]
+    for t in texts:
+        if len(t) >= 400:
+            return t
+    return max(texts, key=len) if texts else ""
+
+
+def row_problem(job):
+    """Why this job must not be written to the sheet, or '' if it is complete."""
+    for field in ("company", "title", "location", "age", "link"):
+        if str(job.get(field) or "").strip().lower() in EMPTY_VALUES:
+            return f"missing {field}"
+    link = str(job["link"]).strip()
+    if not link.lower().startswith(("http://", "https://")):
+        return "apply link is not an http(s) URL"
+    host = (urlparse(link).netloc or "").lower()
+    if any(host == h or host.endswith("." + h) for h in BOARD_HOSTS):
+        return f"apply link is still on the job board ({host})"
+    if looks_like_captcha(link, ""):
+        return "apply link looks like a bot-check page"
+    if not is_within_24h(job["age"]):
+        return f"not posted within 24h ('{job['age']}')"
+    return ""
+
+
+def append_job(sheet, job, seen_links, seen_jobs):
+    """Append one job to the sheet. Google picks the next free row, so scrapers running
+    at the same time cannot overwrite each other. Skips duplicates and incomplete jobs.
+    Returns True if the row was written."""
+    link = str(job.get("link") or "").strip()
+    key = (str(job.get("company") or "").strip().lower(), str(job.get("title") or "").strip().lower())
+    if not link or link in seen_links or (key[0] and key[1] and key in seen_jobs):
+        return False
+    problem = row_problem(job)
+    if problem:
+        print(f"  Skipped '{job.get('title', '')}' @ {job.get('company', '')}: {problem}")
+        return False
+    row = [
+        "=ROW()-1", job["company"], job["title"], job["location"], job["age"],
+        make_link_formula(link), date.today().strftime("%m/%d/%Y"), job["platform"],
+        clean_description(job.get("description", "")),
+    ]
+    for attempt in range(3):
+        try:
+            sheet.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
+            seen_links.add(link)
+            seen_jobs.add(key)
+            return True
+        except Exception as e:
+            if attempt == 2:
+                print(f"  Google Sheets sync failed for '{job.get('title', '')}': {e}")
+            else:
+                time.sleep(2)
+    return False
+
+
+async def read_description(page):
+    """Description text of the page that is open: JSON-LD first, then the main text block."""
+    candidates = []
     try:
-        sheet_row = [
-            str(next_no), job.get("company", ""), job.get("title", ""),
-            job.get("location", ""), job.get("posted", ""), make_link_formula(link),
-            date.today().strftime("%m/%d/%Y"), "Hiring Cafe",
-        ]
-        sheet.update(range_name=f"A{next_row}:H{next_row}", values=[sheet_row], value_input_option="USER_ENTERED")
-        seen_links.add(link)
-        seen_jobs.add(job_key)
-        return next_row + 1, next_no + 1
-    except Exception as e:
-        print(f"  Google Sheets sync failed for '{job.get('title', '')}': {e}")
-        return next_row, next_no
+        candidates.append(description_from_jsonld(await page.evaluate(JSONLD_JS)))
+    except Exception:
+        pass
+    try:
+        candidates.append(await page.evaluate(BLOCK_JS))
+    except Exception:
+        pass
+    return pick_description(candidates)
 
 
 async def main():
@@ -230,6 +341,7 @@ async def main():
     location = sys.argv[2] if len(sys.argv) > 2 else "United States"
 
     jobs = []
+    run_start = time.time()
 
     async with async_playwright() as p:
         os.makedirs(PROFILE_DIR, exist_ok=True)
@@ -279,68 +391,19 @@ async def main():
         for attempt in range(4):
             try:
                 print("  Clearing local storage to prevent default saved modes...")
-                await page.goto("https://hiringcafe.com/", timeout=60000)
+                await page.goto("https://hiringcafe.com/", wait_until="domcontentloaded", timeout=60000)
                 await page.evaluate("window.localStorage.clear(); window.sessionStorage.clear();")
-                await page.wait_for_timeout(1000)
 
                 print(f"  Navigating to search URL: {search_url}")
                 await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(5000)
-                
-                # 1. Open the filter modal by clicking the chip if it exists
                 try:
-                    chip_selector = "button.flex.items-center.space-x-4"
-                    await page.wait_for_selector(chip_selector, timeout=5000)
-                    await page.click(chip_selector)
-                    await page.wait_for_timeout(2000)
-                    
-                    # 2. Inside the modal, ensure Remote is checked and others unchecked
-                    await page.evaluate('''() => {
-                        const buttons = Array.from(document.querySelectorAll('button, div[role="button"], label'));
-                        
-                        buttons.forEach(btn => {
-                            const txt = (btn.textContent || '').trim().toLowerCase();
-                            const isChecked = btn.getAttribute('aria-checked') === 'true' || 
-                                              btn.getAttribute('data-state') === 'checked' || 
-                                              btn.classList.contains('bg-pink-600') ||
-                                              (btn.querySelector('input') && btn.querySelector('input').checked);
-                            
-                            if ((txt === 'onsite' || txt === 'on-site' || txt === 'hybrid' || txt === 'field') && isChecked) {
-                                btn.click();
-                            } else if (txt === 'remote' && !isChecked) {
-                                btn.click();
-                            }
-                        });
-                    }''')
-                    await page.wait_for_timeout(1000)
-                    
-                    # 3. If there is a location input, set it to United States
-                    await page.evaluate('''() => {
-                        const locInput = document.querySelector('input[placeholder*="location" i], input[placeholder*="country" i]');
-                        if (locInput) {
-                            locInput.value = 'United States';
-                            locInput.dispatchEvent(new Event('input', { bubbles: true }));
-                        }
-                    }''')
-                    await page.wait_for_timeout(1000)
-                    
-                    # 4. Click Apply or close modal
-                    await page.evaluate('''() => {
-                        const applyBtn = Array.from(document.querySelectorAll('button')).find(b => (b.textContent || '').trim().toLowerCase() === 'apply');
-                        if (applyBtn) {
-                            applyBtn.click();
-                        } else {
-                            // Press escape if no apply button
-                            document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-                        }
-                    }''')
-                    await page.wait_for_timeout(3000)
-                    
-                except Exception as e:
-                    print("  Could not interact with filter modal (maybe it didn't appear). Error:", e)
+                    await page.wait_for_selector('a[href^="/job/"]', timeout=10000)
+                except Exception:
+                    pass
 
-                # Fallback: if the chip is STILL showing the wrong text after closing the modal, delete it
-                await page.evaluate('''() => {
+                # If a filter chip shows the wrong setting (Hybrid / Onsite / Field), remove it
+                removed_chip = await page.evaluate('''() => {
+                    let removed = false;
                     const chips = Array.from(document.querySelectorAll('div.bg-gray-200.rounded-md'));
                     chips.forEach(chip => {
                         const txt = chip.textContent || '';
@@ -348,12 +411,15 @@ async def main():
                             const trash = chip.querySelector('svg.text-red-500');
                             if (trash) {
                                 const btn = trash.closest('button');
-                                if (btn) btn.click();
+                                if (btn) { btn.click(); removed = true; }
                             }
                         }
                     });
+                    return removed;
                 }''')
-                await page.wait_for_timeout(2000)
+                if removed_chip:
+                    await page.wait_for_timeout(2000)
+                print(f"  Search page ready ({time.time() - run_start:.0f}s since start)")
                 break
             except Exception as e:
                 if attempt == 3:
@@ -364,9 +430,11 @@ async def main():
 
         # Hiring Cafe uses URL pagination. We'll collect up to 50 links.
         all_job_links = []
+        link_ages = {}
         page_num = 1
         
         print("  Collecting job links across pages...")
+        page_start = time.time()
         while True:
             try:
                 # Wait for job links to load
@@ -375,6 +443,7 @@ async def main():
                 except:
                     print(f"  No more jobs found on page {page_num}.")
                     break
+                await _wait_for_links_to_settle(page)
 
                 current_links_data = await page.eval_on_selector_all(
                     'a[target="_blank"][rel="noopener noreferrer"][href^="/job/"]',
@@ -388,29 +457,30 @@ async def main():
                 unique_links = []
                 for item in current_links_data:
                     href = item['href']
-                    if href not in unique_links:
-                        text = item['text'].lower()
-                        if "today" in text or "just now" in text:
-                            unique_links.append(href)
-                            continue
-                        
+                    if href in unique_links:
+                        continue
+                    text = item['text'].lower()
+                    age_text = None
+                    if "just now" in text:
+                        age_text = "Just now"
+                    elif "today" in text:
+                        age_text = "Today"
+                    else:
                         match = re.search(r'(?:posted)?\s*(\d+)\s*(mo|months?|w|weeks?|d|days?|h|hrs?|hours?|m|mins?|minutes?)(?:\s*ago)?\b', text)
                         if match:
-                            value = int(match.group(1))
-                            unit = match.group(2)
-                            if unit in ("h", "hr", "hrs", "hour", "hours") and value <= 24:
-                                unique_links.append(href)
-                            elif unit in ("m", "min", "mins", "minute", "minutes"):
-                                unique_links.append(href)
-                            elif unit in ("d", "day", "days") and value <= 1:
-                                unique_links.append(href)
-                
+                            found = re.sub(r"^\s*posted\s*", "", match.group(0)).strip()
+                            if is_within_24h(found):
+                                age_text = found if found.endswith("ago") else found + " ago"
+                    if age_text:
+                        unique_links.append(href)
+                        link_ages.setdefault(href, age_text)
+
                 if len(current_links_data) == 0:
                     break
                     
                 all_job_links.extend(unique_links)
                 all_job_links = list(dict.fromkeys(all_job_links))
-                print(f"  Page {page_num}: Found {len(unique_links)} fresh jobs out of {len(current_links_data)}. Total collected: {len(all_job_links)}")
+                print(f"  Page {page_num}: Found {len(unique_links)} fresh jobs out of {len(current_links_data)}. Total collected: {len(all_job_links)} ({time.time() - page_start:.1f}s)")
                 
                 if len(all_job_links) >= 50:
                     print(f"  Collected enough links ({len(all_job_links)}). Stopping pagination.")
@@ -424,9 +494,8 @@ async def main():
                     base_url = current_url
                 next_url = f"{base_url}&page={page_num + 1}"
                 
-                await page.wait_for_timeout(2000)
+                page_start = time.time()
                 await page.goto(next_url, wait_until="domcontentloaded", timeout=60000)
-                await page.wait_for_timeout(3000)
                 page_num += 1
                 
             except Exception as e:
@@ -436,26 +505,14 @@ async def main():
         # Remove duplicates across pages
         all_job_links = list(dict.fromkeys(all_job_links))
         total_jobs = len(all_job_links)
-        print(f"\nFound {total_jobs} unique job cards across all pages")
+        print(f"\nFound {total_jobs} unique job cards across all pages ({time.time() - run_start:.0f}s since start)")
 
         if total_jobs == 0:
             print("No jobs found. Exiting.")
             return
 
-        # Ask user how many to extract — only when actually run from an
-        # interactive terminal. Without this check, input() blocks forever
-        # when launched from the GUI (no console attached to read from),
-        # which was hanging this scraper indefinitely.
-        #
-        # sys.stdin.isatty() isn't reliable when launched via
-        # subprocess.Popen(stdin=DEVNULL) as the GUI does - it was sometimes
-        # still reporting True there, so input() got attempted, immediately
-        # failed (no stdin to read), and fell into the bare except below,
-        # which used a leftover 5-job "just in case" cap instead of the
-        # intended 25 - silently capping every GUI run at 5 jobs regardless
-        # of how many were actually found. Track whether isatty() itself is
-        # trustworthy separately from whether input() succeeded, so any
-        # non-interactive/failure path lands on 25, not 5.
+        # Ask how many to extract only when run from a real terminal (input() would block
+        # forever when the launcher starts this script without one). Default: all collected.
         try:
             interactive = sys.stdin.isatty()
         except Exception:
@@ -463,55 +520,67 @@ async def main():
 
         if interactive:
             try:
-                num_to_extract = int(input(f"How many jobs to extract? (1-{total_jobs}): "))
-                num_to_extract = min(num_to_extract, total_jobs, 25)  # Max 25 for safety
+                num_to_extract = min(int(input(f"How many jobs to extract? (1-{total_jobs}): ")), total_jobs)
             except Exception:
-                num_to_extract = min(25, total_jobs)
+                num_to_extract = total_jobs
         else:
-            num_to_extract = min(total_jobs, 25)
+            num_to_extract = total_jobs
 
         # Connect once, before extraction starts, so each job below can be
         # written to the sheet as soon as it's scraped rather than waiting
         # to batch-sync the whole list at the end.
         sheet = get_google_sheet()
-        sheet_next_row, sheet_next_no = find_next_sheet_slot(sheet) if sheet else (None, None)
+        if sheet:
+            ensure_header(sheet)
         seen_links = load_seen_links(sheet) if sheet else set()
         seen_jobs = load_seen_jobs(sheet) if sheet else set()
         print(f"  Loaded {len(seen_links)} existing job links and {len(seen_jobs)} company/title pairs for duplicate check")
 
-        print(f"\nExtracting {num_to_extract} jobs from the collected links...")
-        for i, job_url in enumerate(all_job_links[:num_to_extract]):
-            try:
-                job_data = await extract_job_data(context, job_url)
-            except Exception as e:
-                print(f"    Error extracting {job_url}: {e}")
-                job_data = None
-            if job_data is not None:
+        print(f"\nExtracting {num_to_extract} jobs from the collected links (2 at a time)...")
+        sem = asyncio.Semaphore(2)
+
+        async def process(job_url):
+            async with sem:
+                try:
+                    job_data = await extract_job_data(context, job_url, link_ages.get(job_url, ""), seen_jobs)
+                except Exception as e:
+                    print(f"    Error extracting {job_url}: {e}")
+                    return
+                if job_data is None:
+                    return
                 jobs.append(job_data)
                 if sheet:
-                    sheet_next_row, sheet_next_no = sync_one_job_to_sheet(
-                        sheet, job_data, seen_links, seen_jobs, sheet_next_row, sheet_next_no
-                    )
+                    append_job(sheet, {
+                        "company": job_data["company"], "title": job_data["title"], "location": job_data["location"],
+                        "age": job_data["posted"], "link": job_data["apply_link"], "platform": "Hiring Cafe",
+                        "description": job_data.get("description", ""),
+                    }, seen_links, seen_jobs)
+
+        await asyncio.gather(*(process(u) for u in all_job_links[:num_to_extract]), return_exceptions=True)
 
         await save_to_xlsx(jobs)
         try:
             await context.close()
         except Exception:
             pass
-        print(f"\nDone! Saved {len(jobs)} jobs to jobs.xlsx")
+        print(f"\nDone! Saved {len(jobs)} jobs to jobs.xlsx ({time.time() - run_start:.0f}s total)")
 
-async def extract_job_data(context, job_url):
+async def extract_job_data(context, job_url, age_text, seen_jobs):
     new_page = await context.new_page()
     try:
         await new_page.goto(job_url, wait_until="domcontentloaded", timeout=60000)
-        await new_page.wait_for_timeout(5000)
+
+        # The page is ready once the Apply button is in the page (title and description render with it).
+        # It only has to exist: the site keeps hidden duplicate buttons (mobile layout) that sort first.
+        apply_visible = True
+        try:
+            await new_page.locator("button").filter(has_text=re.compile(r"Apply(?!ed)")).first.wait_for(state="attached", timeout=10000)
+        except Exception:
+            apply_visible = False
 
         # hiring.cafe's page <title> is consistently formatted as
         # "<Job Title> at <Company> — <Location>", which is far less prone
-        # to breaking on a redesign than matching specific CSS classes (the
-        # previous selectors here no longer matched anything real on the
-        # site's current layout - title was landing on the "Job description"
-        # section heading, company and location were empty/wrong).
+        # to breaking on a redesign than matching specific CSS classes.
         title = ""
         company = ""
         job_location = ""
@@ -530,19 +599,19 @@ async def extract_job_data(context, job_url):
             if h1_el:
                 title = (await h1_el.inner_text()).strip()
 
-        posted = ""
-        posted_el = await new_page.query_selector('div.text-xs.font-semibold.text-gray-500')
-        if posted_el:
-            posted = (await posted_el.inner_text()).replace("Posted", "").strip()
+        posted = age_text  # from the job card, where it was already checked as fresh
 
-        if not is_within_24h(posted):
+        # Already in the sheet (same company + title)? Skip before any Apply click.
+        if company and title and (company.lower(), title.lower()) in seen_jobs:
             await new_page.close()
             return None
 
+        board_description = await read_description(new_page)
+        employer_description = ""
+
         # A job is only worth saving if we can confirm a real, external,
         # ready-to-apply link - the hiring.cafe listing page itself isn't
-        # one, so unlike before, this no longer falls back to job_url when
-        # a genuine apply link can't be captured; it skips the job instead.
+        # one, so this skips the job when a genuine apply link can't be captured.
         def _is_ready_to_apply(link, text):
             if not link or link == "about:blank":
                 return False
@@ -553,68 +622,77 @@ async def extract_job_data(context, job_url):
             return True
 
         apply_link = None
+        reason = "" if apply_visible else "Apply button not found on the page"
         try:
-            pages_before = len(context.pages)
             url_before_click = new_page.url
+            popup = None
+            clicked = False
+            if apply_visible:
+                try:
+                    # expect_popup hands back exactly the tab THIS click opened
+                    async with new_page.expect_popup(timeout=15000) as pop:
+                        clicked = await new_page.evaluate(APPLY_CLICK_JS)
+                    popup = await pop.value
+                except Exception:
+                    popup = None
 
-            # Click Apply button
-            await new_page.evaluate('''() => {
-                const buttons = document.querySelectorAll('button');
-                for (let btn of buttons) {
-                    if (btn.textContent && btn.textContent.includes('Apply')) {
-                        btn.click();
-                        return true;
-                    }
-                }
-                return false;
-            }''')
-
-            # Wait for new page/tab to open
-            await new_page.wait_for_timeout(6000)
-
-            pages_after = len(context.pages)
-            if pages_after > pages_before:
-                # Apply opened a new tab - check that one.
-                new_pages = context.pages[pages_before:]
-                if new_pages:
-                    await _wait_for_real_navigation(new_pages[0])
-                    candidate_link = new_pages[0].url
-                    try:
-                        candidate_text = (await new_pages[0].title()) + " " + (await new_pages[0].inner_text("body"))[:500]
-                    except Exception:
-                        candidate_text = ""
-                    await new_pages[0].close()
-                    if _is_ready_to_apply(candidate_link, candidate_text):
-                        apply_link = candidate_link
-            else:
-                # No new tab - some sites navigate the same page instead of
-                # opening a popup. _wait_for_real_navigation() only waits out
-                # an "about:blank" state, which doesn't apply here since this
-                # page was already on a real hiring.cafe URL before the click
-                # - compare against the pre-click URL instead to detect
-                # whether it actually navigated anywhere.
+            if popup is not None:
+                await _wait_for_real_navigation(popup, 15000)
+                candidate_link = popup.url
+                try:
+                    candidate_text = (await popup.title()) + " " + (await popup.inner_text("body"))[:500]
+                except Exception:
+                    candidate_text = ""
+                employer_description = await read_description(popup)
+                try:
+                    await popup.close()
+                except Exception:
+                    pass
+                if _is_ready_to_apply(candidate_link, candidate_text):
+                    apply_link = candidate_link
+                else:
+                    reason = f"the Apply tab opened on a rejected link ({candidate_link[:90]})"
+            elif clicked:
+                # No new tab: some sites navigate the same page instead of opening a popup.
+                try:
+                    await new_page.wait_for_url(lambda u: u != url_before_click, timeout=3000)
+                except Exception:
+                    pass
                 candidate_link = new_page.url
                 if candidate_link != url_before_click:
                     try:
                         candidate_text = (await new_page.title()) + " " + (await new_page.inner_text("body"))[:500]
                     except Exception:
                         candidate_text = ""
+                    employer_description = await read_description(new_page)
                     if _is_ready_to_apply(candidate_link, candidate_text):
                         apply_link = candidate_link
-        except Exception:
-            pass
+                    else:
+                        reason = f"the page navigated to a rejected link ({candidate_link[:90]})"
+                else:
+                    reason = "the Apply click opened no new tab and the page did not navigate"
+            elif apply_visible:
+                reason = "the Apply button could not be clicked"
+        except Exception as e:
+            reason = f"error while capturing the apply link ({e})"
 
         await new_page.close()
 
         if not apply_link:
+            print(f"  Skipped '{title}' @ {company}: {reason or 'no apply link captured'}")
             return None
 
+        description = employer_description if len(employer_description) >= 400 else max(employer_description, board_description, key=len)
         return {"title": title.strip(), "company": company.strip(), "location": job_location.strip(),
-                "posted": posted.strip(), "job_url": job_url, "apply_link": apply_link}
+                "posted": posted.strip(), "job_url": job_url, "apply_link": apply_link,
+                "description": description}
     except Exception as e:
         print(f"    Error: {e}")
-        await new_page.close()
-        return {"title": "", "company": "", "location": "", "posted": "", "job_url": job_url, "apply_link": ""}
+        try:
+            await new_page.close()
+        except Exception:
+            pass
+        return None
 
 async def save_to_xlsx(jobs):
     wb = openpyxl.Workbook()
