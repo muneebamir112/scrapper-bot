@@ -1,5 +1,21 @@
-2026/10/10-00:58:26.306 280c Reusing MANIFEST D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\Local Storage\leveldb/MANIFEST-000001
-2026/10/10-00:58:26.309 280c Recovering log #18
-2026/10/10-00:58:26.309 280c Level-0 table #20: started
-2026/10/10-00:58:26.333 280c Level-0 table #20: 17029 bytes OK
-2026/10/10-00:58:26.353 280c Delete type=0 #18
+2026/10/15-04:49:51.183 4a4c Reusing MANIFEST D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\Local Storage\leveldb/MANIFEST-000001
+2026/10/15-04:49:51.249 4a4c Recovering log #316
+2026/10/15-04:49:51.273 4a4c Reusing old log D:\webncodes\scraper\Hiring_cafe\profiles\hiringcafe_profile\Default\Local Storage\leveldb/000316.log 
+2026/10/15-04:52:17.750 3344 Level-0 table #320: started
+2026/10/15-04:52:17.781 3344 Level-0 table #320: 15108 bytes OK
+2026/10/15-04:52:17.796 3344 Delete type=0 #316
+2026/10/15-04:52:17.796 3344 Compacting 4@0 + 1@1 files
+2026/10/15-04:52:17.962 3344 Generated table #321@0: 666 keys, 1534435 bytes
+2026/10/15-04:52:17.962 3344 Compacted 4@0 + 1@1 files => 1534435 bytes
+2026/10/15-04:52:18.003 3344 compacted to: files[ 0 1 0 0 0 0 0 ]
+2026/10/15-04:52:18.009 3344 Delete type=2 #310
+2026/10/15-04:52:18.009 3344 Delete type=2 #313
+2026/10/15-04:52:18.009 3344 Delete type=2 #315
+2026/10/15-04:52:18.009 3344 Delete type=2 #317
+2026/10/15-04:52:18.010 3344 Delete type=2 #320
+2026/10/15-04:52:27.536 4a4c Level-0 table #323: started
+2026/10/15-04:52:27.796 4a4c Level-0 table #323: 359551 bytes OK
+2026/10/15-04:52:27.843 4a4c Delete type=0 #319
+2026/10/15-04:54:34.619 4a4c Level-0 table #325: started
+2026/10/15-04:54:34.646 4a4c Level-0 table #325: 15737 bytes OK
+2026/10/15-04:54:34.663 4a4c Delete type=0 #322
