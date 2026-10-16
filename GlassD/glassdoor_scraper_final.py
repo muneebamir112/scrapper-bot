@@ -8,13 +8,49 @@ import sys
 import os
 import sys
 if not os.environ.get("JOBBOT_LAUNCHER_AUTH"):
-    import ctypes
-    ctypes.windll.user32.MessageBoxW(0, "Access Denied: This module must be run from the Job Bot Launcher.", "Security Alert", 0x10)
+    msg = "Access Denied: This module must be run from the Job Bot Launcher."
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(0, msg, "Security Alert", 0x10)
+    else:
+        print(msg)
     sys.exit(1)
 import sys
 import re
+import time
+from urllib.parse import urlparse
 from datetime import date
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
+
+TAG = "GD"
+_T0 = time.time()
+STATS = {"cards": 0, "dup": 0, "skip": 0, "saved": 0, "bad": 0, "status": "ok"}
+SKIPS = {}  # why jobs were skipped: reason key -> count
+
+
+def log(level, msg):
+    """One log line: [platform] +seconds-since-start LEVEL message (the launcher adds the clock time)."""
+    print(f"[{TAG}] +{time.time() - _T0:5.1f}s {level:<5} {msg}", flush=True)
+
+
+def short(url):
+    """Host + path only, cut to 70 characters. No query string: links can carry tokens."""
+    u = urlparse(str(url))
+    return (u.netloc + u.path)[:70]
+
+
+def skip(who, key, text):
+    STATS["skip"] += 1
+    SKIPS[key] = SKIPS.get(key, 0) + 1
+    log("SKIP", f"{who}: {text}")
+
+
+def summary():
+    why = " ".join(f"{k}={v}" for k, v in SKIPS.items())
+    log("SUM", f"status={STATS['status']} cards={STATS['cards']} dup={STATS['dup']} skip={STATS['skip']}"
+               f"{' (' + why + ')' if why else ''} saved={STATS['saved']} bad={STATS['bad']} "
+               f"elapsed={time.time() - _T0:.0f}s")
 
 if getattr(sys, 'frozen', False):
     CURRENT_DIR = os.path.dirname(sys.executable)
@@ -36,7 +72,7 @@ def get_google_sheet():
     prints why) if the service account file is missing or the connection fails, so
     the scraper can keep running and just skip the Sheets sync."""
     if not os.path.exists(SERVICE_ACCOUNT_FILE):
-        print(f"  Google Sheets sync disabled: {SERVICE_ACCOUNT_FILE} not found")
+        log("WARN", "Google Sheets sync disabled: service account file not found")
         return None
     try:
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -49,37 +85,25 @@ def get_google_sheet():
             worksheet = spreadsheet.add_worksheet(title="Jobs", rows=1000, cols=20)
         return worksheet
     except Exception as e:
-        print(f"  Google Sheets connection failed: {e}")
+        log("WARN", f"Google Sheets connection failed: {e}")
         return None
 
-def find_next_sheet_slot(worksheet):
-    """Finds the first empty row by looking for empty cells in the Company column (B).
-    If the sheet is completely empty, it writes the headers to row 1."""
-    company_col = worksheet.col_values(2)  # column B
-    
+def ensure_header(worksheet):
+    """Create the header row if the tab is empty (column I holds the job description)."""
+    company_col = worksheet.col_values(2)
     if len(company_col) == 0 or (len(company_col) == 1 and not company_col[0].strip()):
-        # Sheet is completely empty (or missing column B). Write headers!
-        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform"]
-        worksheet.update(range_name="A1:H1", values=[headers], value_input_option="USER_ENTERED")
-        
-        # Format headers to match the user's yellow, bold, centered style
+        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform", "Job Description"]
+        worksheet.update(range_name="A1:I1", values=[headers], value_input_option="USER_ENTERED")
         try:
-            worksheet.format("A1:H1", {
+            worksheet.format("A1:I1", {
                 "backgroundColor": {"red": 0.99, "green": 0.89, "blue": 0.58},
                 "textFormat": {"bold": True, "fontSize": 10},
                 "horizontalAlignment": "CENTER",
             })
+            worksheet.format("I2:I", {"numberFormat": {"type": "TEXT"}, "wrapStrategy": "CLIP"})
         except Exception as e:
-            print(f"  Could not format headers: {e}")
-        return 2, 1
-        
-    next_row = len(company_col) + 1
-    for i in range(1, len(company_col)):
-        if not company_col[i].strip():
-            next_row = i + 1
-            break
-            
-    return next_row, next_row - 1
+            log("WARN", f"could not format headers: {e}")
+
 
 def load_seen_links(worksheet):
     """Application links already logged in the Google Sheet (column F, 'Job Link').
@@ -89,7 +113,7 @@ def load_seen_links(worksheet):
     try:
         link_col = worksheet.col_values(6)
     except Exception as e:
-        print(f"  Could not read existing job links from sheet: {e}")
+        log("WARN", f"could not read existing job links from the sheet: {e}")
         return set()
     return {v.strip() for v in link_col[1:] if v.strip()}
 
@@ -103,7 +127,7 @@ def load_seen_jobs(worksheet):
         company_col = worksheet.col_values(2)
         title_col = worksheet.col_values(3)
     except Exception as e:
-        print(f"  Could not read existing company/job-title pairs from sheet: {e}")
+        log("WARN", f"could not read existing company/title pairs from the sheet: {e}")
         return set()
     seen = set()
     for company, title in zip(company_col[1:], title_col[1:]):
@@ -154,37 +178,35 @@ def looks_like_captcha(url, page_text):
     haystack = f"{url} {page_text}".lower()
     return any(indicator in haystack for indicator in CAPTCHA_INDICATORS)
 
-def _wait_for_real_navigation(page, timeout_ms=8000):
-    """A newly opened tab sits on about:blank for a moment until its actual
-    navigation lands - waiting a fixed delay and then reading page.url risks
-    reading it while it's still blank (which was ending up as the captured
-    application link). Wait for the URL to actually change instead."""
+def _click_and_follow(context, job_page, el):
+    """Click el and return the page to read next: the new tab the click opened (the old page is
+    closed), or job_page if the same tab navigated. Waits up to 15 s for the URL to leave glassdoor.com."""
+    new_tab = None
     try:
-        page.wait_for_url(lambda url: url != "about:blank", timeout=timeout_ms)
+        with context.expect_page(timeout=15000) as info:
+            el.click()
+            # Glassdoor may first ask the user to update job preferences; "Skip for now" dismisses
+            # that prompt and the apply continues.
+            try:
+                skip = job_page.wait_for_selector("button:has-text('Skip for now')", timeout=4000)
+                if skip and skip.is_visible():
+                    skip.click()
+            except TimeoutError:
+                pass
+        new_tab = info.value
     except TimeoutError:
-        pass
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=2000)
-    except Exception:
-        pass
-
-
-def _switch_to_new_tab(context, current_page):
-    """If a click just opened a new tab (e.g. an employer/Indeed apply flow
-    breaking out of Glassdoor's own job-detail tab), close the now-stale
-    current_page and return the new tab; otherwise return current_page
-    unchanged. Without this, the old tab - often left sitting on an Indeed
-    CAPTCHA/verification page - stays open for the rest of the run."""
-    pages = context.pages
-    if len(pages) > 1 and pages[-1] != current_page:
-        new_page = pages[-1]
+        pass  # no new tab: the same page navigated (or nothing happened)
+    if new_tab is not None:
         try:
-            current_page.close()
+            job_page.close()
         except Exception:
             pass
-        _wait_for_real_navigation(new_page)
-        return new_page
-    return current_page
+        job_page = new_tab
+    try:
+        job_page.wait_for_url(lambda u: u != "about:blank" and "glassdoor.com" not in u, timeout=15000)
+    except TimeoutError:
+        pass
+    return job_page
 
 
 def make_link_formula(url):
@@ -193,6 +215,193 @@ def make_link_formula(url):
     plain URL text, so nothing downstream that reads the sheet is affected)."""
     escaped = url.replace('"', '""')
     return f'=HYPERLINK("{escaped}", "{escaped}")'
+
+import html as _html
+import json
+
+
+def is_within_24h(age_text):
+    """Strict check of a 'posted X ago' text: only hours, minutes, 'today' and 'just now'
+    count. Days, weeks, months and unrecognised text do not ('1d ago' can be ~47 h old)."""
+    text = str(age_text or "").lower().strip()
+    if not text:
+        return False
+    if "just now" in text or "today" in text or text == "now":
+        return True
+    match = re.search(r"(\d+)\+?\s*(h|hrs?|hours?|m|mins?|minutes?)\b", text)
+    if not match:
+        return False
+    return match.group(2).startswith("m") or int(match.group(1)) <= 24
+
+
+EMPTY_VALUES = {"", "n/a", "na", "unknown", "none", "null", "-", "undefined"}
+BOARD_HOSTS = ("glassdoor.com", "hiring.cafe", "hiringcafe.com", "jobgether.com")
+
+# Job-description capture: the page's JSON-LD first, then the largest block of readable text.
+JSONLD_JS = """() => Array.from(document.querySelectorAll('script[type="application/ld+json"]')).map(s => s.textContent)"""
+BLOCK_JS = """() => {
+  const groups = ['[class*="description" i], [id*="description" i], [class*="job-details" i], [class*="jobdetail" i]', 'article', 'main, [role="main"]'];
+  for (const g of groups) {
+    let best = '';
+    for (const el of document.querySelectorAll(g)) {
+      const t = (el.innerText || '').trim();
+      if (t.length > best.length && t.length < 60000) best = t;
+    }
+    if (best.length >= 400) return best;
+  }
+  return document.body ? document.body.innerText : '';
+}"""
+
+
+def html_to_text(raw):
+    s = re.sub(r"<(script|style)\b.*?</\1>", " ", str(raw), flags=re.I | re.S)
+    s = re.sub(r"<li\b[^>]*>", "\n- ", s, flags=re.I)
+    s = re.sub(r"</?(p|div|br|ul|ol|h[1-6]|tr|section)\b[^>]*>", "\n", s, flags=re.I)
+    return _html.unescape(re.sub(r"<[^>]+>", "", s))
+
+
+def description_from_jsonld(raws):
+    """Description of a schema.org JobPosting found in the page's JSON-LD blocks, as text."""
+    def find(node):
+        if isinstance(node, list):
+            for item in node:
+                found = find(item)
+                if found:
+                    return found
+        elif isinstance(node, dict):
+            kind = node.get("@type")
+            if (kind == "JobPosting" or (isinstance(kind, list) and "JobPosting" in kind)) and isinstance(node.get("description"), str):
+                return node["description"]
+            for value in node.values():
+                if isinstance(value, (list, dict)):
+                    found = find(value)
+                    if found:
+                        return found
+        return None
+
+    for raw in raws or []:
+        try:
+            found = find(json.loads(raw))
+        except Exception:
+            continue
+        if found:
+            return html_to_text(found)
+    return ""
+
+
+def clean_description(text):
+    """Make a description safe for one sheet cell: no control characters, tidy lines,
+    capped at 20,000 characters, never starting with a character Sheets reads as a formula."""
+    if not text:
+        return ""
+    s = str(text).replace("\r\n", "\n").replace("\r", "\n").replace("\xa0", " ")
+    s = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f\u200b\u200c\u200d\u2060\ufeff]", "", s)
+    s = "\n".join(re.sub(r"[ \t]+", " ", line).strip() for line in s.split("\n"))
+    s = re.sub(r"\n{3,}", "\n\n", s).strip()
+    if len(s) > 20000:
+        s = s[:20000].rstrip() + "\n... [truncated]"
+    if s[:1] in ("=", "+", "-", "@"):
+        s = " " + s
+    return s
+
+
+def pick_description(candidates):
+    """First candidate with at least 400 characters, else the longest non-empty one."""
+    texts = [t for t in (clean_description(c) for c in candidates if c) if t]
+    for t in texts:
+        if len(t) >= 400:
+            return t
+    return max(texts, key=len) if texts else ""
+
+
+def row_problem(job):
+    """Why this job must not be written to the sheet, or '' if it is complete."""
+    for field in ("company", "title", "location", "age", "link"):
+        if str(job.get(field) or "").strip().lower() in EMPTY_VALUES:
+            return f"missing {field}"
+    link = str(job["link"]).strip()
+    if not link.lower().startswith(("http://", "https://")):
+        return "apply link is not an http(s) URL"
+    host = (urlparse(link).netloc or "").lower()
+    if any(host == h or host.endswith("." + h) for h in BOARD_HOSTS):
+        return f"apply link is still on the job board ({host})"
+    if looks_like_captcha(link, ""):
+        return "apply link looks like a bot-check page"
+    if not is_within_24h(job["age"]):
+        return f"not posted within 24h ('{job['age']}')"
+    return ""
+
+
+def append_job(sheet, job, seen_links, seen_jobs):
+    """Append one job to the sheet. Google picks the next free row, so scrapers running
+    at the same time cannot overwrite each other. Skips duplicates and incomplete jobs.
+    Returns True if the row was written."""
+    link = str(job.get("link") or "").strip()
+    key = (str(job.get("company") or "").strip().lower(), str(job.get("title") or "").strip().lower())
+    who = f"{job.get('company', '')} | {job.get('title', '')}"
+    if not link:
+        skip(who, "no_link", "no apply link")
+        return False
+    if link in seen_links or (key[0] and key[1] and key in seen_jobs):
+        STATS["dup"] += 1
+        log("DUP", f"{who}: {'link' if link in seen_links else 'company+title'} already in the sheet (at write)")
+        return False
+    problem = row_problem(job)
+    if problem:
+        skip(who, "incomplete", problem)
+        return False
+    description = clean_description(job.get("description", ""))
+    row = [
+        "=ROW()-1", job["company"], job["title"], job["location"], job["age"],
+        make_link_formula(link), date.today().strftime("%m/%d/%Y"), job["platform"],
+        description,
+    ]
+    for attempt in range(3):
+        try:
+            sheet.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
+            seen_links.add(link)
+            seen_jobs.add(key)
+            STATS["saved"] += 1
+            log("SAVE", f"saved {who} -> {short(link)} (description {len(description)} chars)")
+            return True
+        except Exception as e:
+            if attempt == 2:
+                STATS["bad"] += 1
+                log("ERR", f"{who}: could not write the row to the sheet ({str(e)[:120]})")
+            else:
+                time.sleep(2)
+    return False
+
+
+def read_description(page):
+    """Description text of the page that is open: JSON-LD first, then the main text block."""
+    candidates = []
+    try:
+        candidates.append(description_from_jsonld(page.evaluate(JSONLD_JS)))
+    except Exception:
+        pass
+    try:
+        candidates.append(page.evaluate(BLOCK_JS))
+    except Exception:
+        pass
+    return pick_description(candidates)
+
+
+def connect_sheet():
+    """Sheet connection plus the duplicate-check lists (runs in a thread while the browser works)."""
+    t0 = time.time()
+    try:
+        sheet = get_google_sheet()
+        if sheet:
+            ensure_header(sheet)
+        seen_links = load_seen_links(sheet) if sheet else set()
+        seen_jobs = load_seen_jobs(sheet) if sheet else set()
+        log("INFO", f"phase=sheet connected in {time.time() - t0:.1f}s")
+        return sheet, seen_links, seen_jobs
+    except Exception as e:
+        log("WARN", f"Google Sheets connection failed: {e}")
+        return None, set(), set()
+
 
 def main():
     # For testing: limit number of jobs processed (set to None for unlimited)
@@ -211,7 +420,9 @@ def main():
                 job_title = lines[0].strip()
                 location = lines[1].strip()
         except Exception as e:
-            print(f"Error reading inputs: {e}")
+            log("ERR", f"could not read the inputs: {e}")
+            STATS["status"] = "FAILED"
+            summary()
             return
     
     # Create Excel
@@ -220,12 +431,11 @@ def main():
     ws.title = "Glassdoor Jobs"
     ws.append(EXCEL_HEADER)
 
-    # Connect to Google Sheets (jobs are pushed there live, row by row, as they're scraped)
-    sheet = get_google_sheet()
-    sheet_next_row, sheet_next_no = find_next_sheet_slot(sheet) if sheet else (None, None)
-    seen_links = load_seen_links(sheet) if sheet else set()
-    seen_jobs = load_seen_jobs(sheet) if sheet else set()
-    print(f"  Loaded {len(seen_links)} existing job links and {len(seen_jobs)} company/title pairs for duplicate check")
+    # Connect to Google Sheets in a background thread while the browser starts and the search runs
+    # (jobs are pushed there live, row by row, as they're scraped). The thread is finished before
+    # the first row is written, so the sheet is never used by two threads at once.
+    sheet_future = ThreadPoolExecutor(max_workers=1).submit(connect_sheet)
+    log("INFO", f"phase=start keyword='{job_title}' location='{location}'")
 
     # Launch stealth browser (real Chrome, persistent profile)
     os.makedirs(PROFILE_DIR, exist_ok=True)
@@ -238,22 +448,26 @@ def main():
                 no_viewport=True,
             )
         except Exception as e:
-            print(f"Launch failed: {e}")
+            log("ERR", f"Chrome launch failed: {e}")
+            STATS["status"] = "FAILED"
+            summary()
             return
 
         page = context.pages[0] if context.pages else context.new_page()
 
         try:
             # Step 1: Navigate to Glassdoor Jobs
+            log("INFO", "step=open glassdoor.com")
             for attempt in range(4):
                 try:
                     page.goto("https://www.glassdoor.com/Job/index.htm", timeout=60000, wait_until="domcontentloaded")
                     break
                 except Exception as e:
                     if attempt == 3:
-                        print("Network error: Could not reach glassdoor.com after multiple attempts. Please check your internet connection.")
+                        log("ERR", "network error: could not reach glassdoor.com after multiple attempts")
+                        STATS["status"] = "FAILED"
                         return
-                    print(f"Network hiccup reaching glassdoor.com, retrying ({attempt + 1}/3)...")
+                    log("WARN", f"network hiccup reaching glassdoor.com, retrying ({attempt + 1}/3)")
                     page.wait_for_timeout(2000)
             page.wait_for_timeout(2000)
             
@@ -268,10 +482,11 @@ def main():
                 page.wait_for_selector("input[aria-labelledby='searchBar-jobTitle_label'], input[name='sc.keyword']", timeout=15000)
                 page.wait_for_selector("input[aria-labelledby='searchBar-location_label'], input[name='sc.location']", timeout=15000)
             except TimeoutError:
-                print("  Search inputs not found, trying alternative selectors...")
+                log("WARN", "search inputs not found, trying alternative selectors")
                 page.wait_for_selector("input[placeholder*='job title'], input[placeholder*='keyword']", timeout=15000)
                 page.wait_for_selector("input[placeholder*='location'], input[name='location']", timeout=15000)
             
+            log("INFO", "step=fill the search form")
             # Fill job title
             page.fill("input[aria-labelledby='searchBar-jobTitle_label'], input[name='sc.keyword']", job_title)
             page.wait_for_timeout(300)
@@ -296,10 +511,12 @@ def main():
                 pass
 
             # Step 4: Wait for results
+            log("INFO", "step=wait for results")
             page.wait_for_selector("li[data-test='jobListing']", timeout=30000)
             page.wait_for_timeout(3000)
             
             # Step 5: Apply Remote filter and ensure others are unchecked
+            log("INFO", "step=apply the Remote filter")
             try:
                 # Uncheck Onsite/Hybrid if they are active
                 page.evaluate('''() => {
@@ -324,28 +541,40 @@ def main():
                 except TimeoutError:
                     pass
             except TimeoutError:
-                print("  Remote button not found")
+                log("WARN", "Remote button not found")
+
+            if "remoteWorkType=1" not in page.url:
+                log("WARN", "the Remote filter did not apply (remoteWorkType=1 is missing from the address); stopping so no on-site jobs are saved")
+                STATS["status"] = "STOPPED"
+                return
 
             # Step 5b: Apply Glassdoor's own "Date posted: Last day" filter via
             # its fromAge=1 URL param, instead of loading every listing (most
             # of which are >24h old) and filtering them out client-side after
             # the fact - this cuts the number of jobs to load and process from
             # dozens/hundreds down to just the ones already within 24h.
+            log("INFO", "step=apply the last-24h filter")
             try:
                 sep = "&" if "?" in page.url else "?"
                 date_filtered_url = f"{page.url}{sep}fromAge=1"
                 page.goto(date_filtered_url, timeout=30000, wait_until="domcontentloaded")
                 page.wait_for_timeout(2000)
             except Exception as e:
-                print(f"  Could not apply date filter, falling back to client-side filtering only: {e}")
+                log("WARN", f"could not apply the date filter, falling back to client-side filtering only: {e}")
+
+            date_filter_on = "fromAge=1" in page.url
+            if not date_filter_on:
+                log("WARN", "the 'last day' filter is not in the address; jobs without a readable age will be skipped")
 
             # Step 6: Load all jobs by clicking "Show more jobs" or scrolling
+            log("INFO", "step=load all results")
             max_load_attempts = 50
             load_attempts = 0
             last_count = 0
             consecutive_no_increase = 0
             
             while load_attempts < max_load_attempts and consecutive_no_increase < 3:
+                round_start = time.time()
                 # Get current job count
                 current_count = len(page.query_selector_all("li[data-test='jobListing']"))
                 
@@ -365,14 +594,16 @@ def main():
                 ]
                 
                 for selector in button_selectors:
+                    click_start = time.time()
                     try:
                         btn = page.query_selector(selector)
                         if btn and btn.is_visible():
-                            btn.click()
+                            btn.click(timeout=5000)
                             page.wait_for_timeout(3000)
                             clicked = True
                             break
-                    except Exception:
+                    except Exception as e:
+                        log("WARN", f"'show more' click with {selector[:45]} did not work after {time.time() - click_start:.1f}s: {str(e).splitlines()[0][:80]}")
                         continue
 
                 # Check if job count increased
@@ -383,17 +614,33 @@ def main():
                     consecutive_no_increase += 1
 
                 load_attempts += 1
+                log("INFO", f"load round {load_attempts}: {new_count} listings, {time.time() - round_start:.1f}s, show-more clicked={clicked}")
 
             job_cards = page.query_selector_all("li[data-test='jobListing']")
             total = len(job_cards)
-            print(f"Found {total} jobs")
+            STATS["cards"] = total
+            log("INFO", f"phase=extract {total} listings found")
+
+            # The sheet connection was started while the browser worked.
+            sheet, seen_links, seen_jobs = sheet_future.result()
+            log("INFO", f"duplicate check loaded: {len(seen_links)} links, {len(seen_jobs)} company/title pairs")
 
             # Step 8: Process all jobs
             processed = 0
             for idx, card in enumerate(job_cards, 1):
+                job_start = time.time()
+                who = f"#{idx}"
+                try:
+                    link_el = card.query_selector("a[data-test='job-link']")
+                    card_title = link_el.inner_text().strip().splitlines()[0][:60] if link_el else ""
+                    if card_title:
+                        who = f"#{idx} {card_title}"
+                except Exception:
+                    pass
                 try:
                     # Skip Easy Apply
                     if card.query_selector("[data-test='easy-apply'], .easy-apply, div:has-text('Easy Apply')"):
+                        skip(who, "easy_apply", "Easy Apply (no employer link)")
                         continue
 
                     # Extract job age and filter (skip if older than 24 hours)
@@ -403,13 +650,19 @@ def main():
                     if age_el:
                         job_age = age_el.inner_text().strip()
                         age_days = parse_job_age(job_age)
-                    
+
+                    # The cards show no posting age; the last-day filter (fromAge=1) is on, so say so explicitly.
+                    if job_age == "N/A" and date_filter_on:
+                        job_age = "Within 24h"
+
                     if age_days > 1:
+                        skip(who, "older_24h", f"older than 24h ({job_age})")
                         continue
 
                     # Get job URL
                     link = card.query_selector("a[data-test='job-link'], a[href*='job/']")
                     if not link:
+                        skip(who, "no_card_link", "no job link on the card")
                         continue
 
                     job_url = link.get_attribute("href")
@@ -453,11 +706,17 @@ def main():
                         except TimeoutError:
                             continue
                     
+                    description = read_description(job_page)
+                    who = f"#{idx} {company} | {job_t}"
+                    log("JOB", f"{who}: page read in {time.time() - job_start:.1f}s (description {len(description)} chars)")
+
                     # Same job already in the sheet from another platform (or
                     # earlier in this run)? Skip before spending time on the
                     # Apply-click flow below.
                     job_key = (company.strip().lower(), job_t.strip().lower())
                     if job_key in seen_jobs:
+                        STATS["dup"] += 1
+                        log("DUP", f"{who}: company+title already in the sheet (before the Apply click)")
                         job_page.close()
                         continue
 
@@ -472,42 +731,30 @@ def main():
                         try:
                             el = job_page.wait_for_selector(sel, timeout=4000)
                             if el and el.is_visible():
-                                el.click()
                                 applied = True
-                                job_page.wait_for_timeout(3000)
-                                # This click sometimes opens the employer's/Indeed's
-                                # apply page in a new tab rather than navigating
-                                # job_page itself - switch to it and close the old
-                                # tab so it doesn't sit open (often on an Indeed
-                                # CAPTCHA/verification page) for the rest of the run.
-                                job_page = _switch_to_new_tab(context, job_page)
+                                job_page = _click_and_follow(context, job_page, el)
                                 break
                         except TimeoutError:
                             continue
 
                     if not applied:
+                        skip(who, "no_apply_button", "no 'Apply on employer site' button")
                         job_page.close()
                         continue
 
                     # Click Start Application if present
-                    for sel in [
-                        "button:has-text('Start my application')",
-                        "[data-test='start-application-button']",
-                        "button:has-text('Start application')"
-                    ]:
-                        try:
-                            el = job_page.wait_for_selector(sel, timeout=3000)
-                            if el and el.is_visible():
-                                el.click()
-                                job_page.wait_for_timeout(10000)
-                                job_page = _switch_to_new_tab(context, job_page)
-                                break
-                        except TimeoutError:
-                            pass
+                    try:
+                        el = job_page.wait_for_selector(
+                            "button:has-text('Start my application'), [data-test='start-application-button'], button:has-text('Start application')",
+                            timeout=3000)
+                        if el and el.is_visible():
+                            job_page = _click_and_follow(context, job_page, el)
+                    except TimeoutError:
+                        pass
 
                     app_url = job_page.url.strip()
                     if not app_url or app_url == "about:blank":
-                        print(f"  [{idx}] Skipped: application tab never left about:blank (not a ready-to-apply link)")
+                        skip(who, "blank_tab", "the application tab never left about:blank")
                         job_page.close()
                         continue
 
@@ -523,7 +770,7 @@ def main():
                     except Exception:
                         page_text = ""
                     if looks_like_captcha(app_url, page_text):
-                        print(f"  [{idx}] Skipped: CAPTCHA/verification page (not a ready-to-apply link)")
+                        skip(who, "captcha", f"bot-check/verification page ({short(app_url)})")
                         job_page.close()
                         continue
 
@@ -532,45 +779,41 @@ def main():
                     # leaving Glassdoor - not a page the applicant can actually
                     # submit an application from, so it doesn't count as
                     # ready-to-apply either.
-                    # if "glassdoor.com" in app_url:
-                    #     print(f"  [{idx}] Skipped: still on Glassdoor, never reached the employer's application page")
-                    #     job_page.close()
-                    #     continue
+                    if "glassdoor.com" in app_url:
+                        skip(who, "still_glassdoor", f"still on Glassdoor, never reached the employer's page ({short(app_url)})")
+                        job_page.close()
+                        continue
 
                     # Duplicate check: skip only if this exact application link was
                     # already added (in this run or a past one). Multiple postings from
                     # the same company are fine as long as each has its own link.
                     if app_url in seen_links:
+                        STATS["dup"] += 1
+                        log("DUP", f"{who}: application link already in the sheet (before the write)")
                         job_page.close()
                         continue
 
-                    ws.append([company, job_t, loc, job_age, app_url])
-                    seen_links.add(app_url)
-                    seen_jobs.add(job_key)
-
+                    saved = True
+                    if not sheet:
+                        log("WARN", f"{who}: sheet not connected; only in glassdoor.xlsx")
                     if sheet:
-                        try:
-                            sheet_row = [
-                                str(sheet_next_no), company, job_t, loc, job_age,
-                                make_link_formula(app_url), date.today().strftime("%m/%d/%Y"),
-                                "Glassdoor",
-                            ]
-                            sheet.update(range_name=f"A{sheet_next_row}:H{sheet_next_row}", values=[sheet_row], value_input_option="USER_ENTERED")
-                            sheet_next_row += 1
-                            sheet_next_no += 1
-                        except Exception as e:
-                            print(f"  [{idx}] Google Sheets sync failed: {e}")
-
-                    processed += 1
+                        saved = append_job(sheet, {
+                            "company": company, "title": job_t, "location": loc, "age": job_age,
+                            "link": app_url, "platform": "Glassdoor", "description": description,
+                        }, seen_links, seen_jobs)
+                    if saved:
+                        ws.append([company, job_t, loc, job_age, app_url])
+                        processed += 1
                     job_page.close()
                     
                     # Test mode limit
                     if TEST_LIMIT and processed >= TEST_LIMIT:
-                        print(f"  Test limit reached ({TEST_LIMIT} jobs). Stopping early.")
+                        log("INFO", f"test limit reached ({TEST_LIMIT} jobs); stopping early")
                         break
                     
                 except Exception as e:
-                    print(f"  [{idx}] Error: {e}")
+                    STATS["bad"] += 1
+                    log("ERR", f"{who}: error while processing the job: {str(e)[:150]}")
                     # Close job_page plus any other stray tab this job may have
                     # opened (e.g. a popup from an unexpected click) that
                     # job_page never got reassigned to before the error hit -
@@ -586,14 +829,16 @@ def main():
             
             # Save Excel
             wb.save("glassdoor.xlsx")
-            print(f"\nDone! Saved {processed} jobs to glassdoor.xlsx")
+            log("INFO", f"done: {STATS['saved']} rows written to the sheet, {processed} jobs in glassdoor.xlsx")
             
         except Exception as e:
-            print(f"Error: {e}")
+            log("ERR", f"fatal: {str(e)[:200]}")
+            STATS["status"] = "FAILED"
             import traceback
             traceback.print_exc()
         finally:
             context.close()
+            summary()
 
 if __name__ == "__main__":
     main()
