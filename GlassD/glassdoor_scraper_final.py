@@ -352,16 +352,81 @@ BOARD_HOSTS = ("glassdoor.com", "hiring.cafe", "hiringcafe.com", "jobgether.com"
 # Job-description capture: the page's JSON-LD first, then the largest block of readable text.
 JSONLD_JS = """() => Array.from(document.querySelectorAll('script[type="application/ld+json"]')).map(s => s.textContent)"""
 BLOCK_JS = """() => {
-  const groups = ['[class*="description" i], [id*="description" i], [class*="job-details" i], [class*="jobdetail" i]', 'article', 'main, [role="main"]'];
-  for (const g of groups) {
+  // Check if an element is inside a cookie, consent, banner, or dialog overlay
+  function isCookieOrOverlay(node) {
+    if (!node || node === document.body) return false;
+    try {
+      if (node.closest('#onetrust-consent-sdk, #onetrust-banner-sdk, #CybotCookiebotDialog, [id*="cookie" i], [class*="cookie" i], [id*="consent" i], [class*="consent" i], [id*="banner" i], [class*="banner" i], [role="dialog"], [aria-modal="true"], .modal, .popup')) {
+        return true;
+      }
+    } catch (e) {}
+    return false;
+  }
+
+  // Quick check if text is predominantly a cookie/privacy consent notice
+  function isCookieText(text) {
+    if (!text) return false;
+    const lower = text.toLowerCase();
+    const cookieHits = (lower.match(/cookie/g) || []).length;
+    const consentHits = (lower.match(/consent|gdpr|tracking|preferences|strictly necessary/g) || []).length;
+    if ((cookieHits >= 2 || (cookieHits >= 1 && consentHits >= 1)) && !lower.includes('requirements') && !lower.includes('responsibilities') && !lower.includes('qualifications')) {
+      return true;
+    }
+    if (lower.startsWith('we use cookies') || lower.startsWith('by clicking "accept') || lower.startsWith('by clicking accept')) {
+      return true;
+    }
+    return false;
+  }
+
+  // 1. High-priority target selectors for ATS job descriptions
+  const specificSelectors = [
+    '[data-automation-id="jobPostingDescription"]',
+    '[data-automation-id="job-posting-description"]',
+    '[class*="job-description" i]',
+    '[id*="job-description" i]',
+    '[class*="jobDescription" i]',
+    '[id*="jobDescription" i]',
+    '[class*="job_description" i]',
+    '[id*="job_description" i]',
+    '[class*="job-details" i]',
+    '[class*="jobdetail" i]',
+    '[data-testid="job-description"]',
+    '[itemprop="description"]'
+  ];
+
+  for (const s of specificSelectors) {
+    for (const el of document.querySelectorAll(s)) {
+      if (isCookieOrOverlay(el)) continue;
+      const t = (el.innerText || '').trim();
+      if (t.length >= 200 && t.length < 60000 && !isCookieText(t)) {
+        return t;
+      }
+    }
+  }
+
+  // 2. Broader groups, explicitly filtering out cookie/consent elements
+  const fallbackGroups = [
+    'article',
+    'main, [role="main"]',
+    '[class*="description" i]:not([class*="cookie" i]):not([class*="banner" i]):not([class*="consent" i]), [id*="description" i]:not([id*="cookie" i]):not([id*="banner" i]):not([id*="consent" i])'
+  ];
+
+  for (const g of fallbackGroups) {
     let best = '';
     for (const el of document.querySelectorAll(g)) {
+      if (isCookieOrOverlay(el)) continue;
       const t = (el.innerText || '').trim();
+      if (isCookieText(t)) continue;
       if (t.length > best.length && t.length < 60000) best = t;
     }
     if (best.length >= 400) return best;
   }
-  return document.body ? document.body.innerText : '';
+
+  if (document.body) {
+    const bodyText = (document.body.innerText || '').trim();
+    if (!isCookieText(bodyText)) return bodyText;
+  }
+  return '';
 }"""
 
 
@@ -417,9 +482,62 @@ def clean_description(text):
     return s
 
 
+COOKIE_PATTERNS = [
+    re.compile(r"we use cookies", re.IGNORECASE),
+    re.compile(r"cookie policy", re.IGNORECASE),
+    re.compile(r"cookie preferences", re.IGNORECASE),
+    re.compile(r"accept all cookies", re.IGNORECASE),
+    re.compile(r"accept cookies", re.IGNORECASE),
+    re.compile(r"allow all cookies", re.IGNORECASE),
+    re.compile(r"allow cookies", re.IGNORECASE),
+    re.compile(r"strictly necessary cookies", re.IGNORECASE),
+    re.compile(r"performance cookies", re.IGNORECASE),
+    re.compile(r"targeting cookies", re.IGNORECASE),
+    re.compile(r"functional cookies", re.IGNORECASE),
+    re.compile(r"by clicking [\"']?accept[\"']?", re.IGNORECASE),
+    re.compile(r"privacy policy.*cookies", re.IGNORECASE),
+    re.compile(r"manage preferences", re.IGNORECASE),
+    re.compile(r"consent to the use of cookies", re.IGNORECASE),
+    re.compile(r"store and/or access information on a device", re.IGNORECASE),
+]
+
+JOB_SIGNALS = [
+    re.compile(r"requirements?", re.IGNORECASE),
+    re.compile(r"responsibilities", re.IGNORECASE),
+    re.compile(r"qualifications?", re.IGNORECASE),
+    re.compile(r"experience", re.IGNORECASE),
+    re.compile(r"about the role", re.IGNORECASE),
+    re.compile(r"about the job", re.IGNORECASE),
+    re.compile(r"what you(?:'ll| will) do", re.IGNORECASE),
+    re.compile(r"what we(?:'re| are) looking for", re.IGNORECASE),
+    re.compile(r"skills?", re.IGNORECASE),
+    re.compile(r"salary", re.IGNORECASE),
+    re.compile(r"benefits?", re.IGNORECASE),
+]
+
+
+def looks_like_cookie_banner(text):
+    """Returns True if the text is predominantly a cookie/GDPR consent notice."""
+    t = text.strip()
+    if not t:
+        return False
+    cookie_matches = sum(1 for p in COOKIE_PATTERNS if p.search(t))
+    job_matches = sum(1 for p in JOB_SIGNALS if p.search(t))
+    if cookie_matches >= 2 and job_matches == 0:
+        return True
+    if cookie_matches >= 3 and job_matches <= 1:
+        return True
+    if len(t) < 800 and ("cookie" in t.lower() or "consent" in t.lower()) and job_matches == 0:
+        return True
+    if t.lower().startswith("we use cookies") and job_matches == 0:
+        return True
+    return False
+
+
 def pick_description(candidates):
-    """First candidate with at least 400 characters, else the longest non-empty one."""
-    texts = [t for t in (clean_description(c) for c in candidates if c) if t]
+    """First candidate with at least 400 characters, else the longest non-empty one.
+    Ignores candidates that are just cookie banners or privacy consent popups."""
+    texts = [t for t in (clean_description(c) for c in candidates if c) if t and not looks_like_cookie_banner(t)]
     for t in texts:
         if len(t) >= 400:
             return t
@@ -515,8 +633,156 @@ def append_job(sheet, job, seen_links, seen_jobs, is_offline_sync=False):
     return False
 
 
+def dismiss_overlays(page):
+    """Dismiss common cookie consent dialogs, popups, and GDPR modals if present."""
+    dismiss_js = r"""() => {
+        let dismissed = false;
+        const selectors = [
+            '#onetrust-accept-btn-handler',
+            '#onetrust-pc-btn-handler',
+            'button#onetrust-accept-btn-handler',
+            '.onetrust-close-btn-handler',
+            '#onetrust-banner-sdk button',
+            '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+            '#CybotCookiebotDialogBodyButtonAccept',
+            '#CybotCookiebotDialogBodyLevelButtonAccept',
+            '#didomi-notice-agree-button',
+            '.osano-cm-accept-all',
+            '.osano-cm-button--type_save',
+            '#truste-consent-button',
+            '.trustarc-agree-btn',
+            '[data-testid="uc-accept-all-button"]',
+            '#axeptio_btn_acceptAll',
+            'button.cm-btn-success',
+            'button.cm-btn-accept',
+            'button.cky-btn-accept',
+            '.cc-btn.cc-allow',
+            '.cc-btn.cc-dismiss',
+            '[data-cookiebanner="accept_button"]',
+            '.iubenda-cs-accept-btn',
+            'button[id*="cookie-accept" i]',
+            'button[id*="accept-cookie" i]',
+            'button[class*="cookie-accept" i]',
+            'button[class*="accept-cookie" i]',
+            'button[id*="accept-all" i]',
+            'button[class*="accept-all" i]'
+        ];
+        for (const s of selectors) {
+            try {
+                const el = document.querySelector(s);
+                if (el && (el.offsetParent !== null || el.getBoundingClientRect().height > 0)) {
+                    el.click();
+                    dismissed = true;
+                    break;
+                }
+            } catch (e) {}
+        }
+
+        if (!dismissed) {
+            const acceptRegex = /^(accept\s+all\s+cookies|accept\s+all|accept\s+cookies|allow\s+all\s+cookies|allow\s+all|allow\s+cookies|i\s+accept|i\s+agree|agree\s+&\s+close|agree\s+and\s+continue|accept\s+and\s+proceed|accept\s+&\s+continue|accept\s+recommended|agree|got\s+it|dismiss|ok)$/i;
+            const acceptSubRegex = /(accept\s+(all\s+)?cookies|allow\s+(all\s+)?cookies|accept\s+all|allow\s+all|agree\s+to\s+all|accept\s+recommended)/i;
+            const candidates = Array.from(document.querySelectorAll('button, a[role="button"], a.btn, [role="button"], input[type="button"], input[type="submit"]'));
+            for (const el of candidates) {
+                try {
+                    const text = (el.innerText || el.textContent || el.value || el.getAttribute('aria-label') || '').trim();
+                    if (!text || text.length > 50) continue;
+                    if (acceptRegex.test(text) || acceptSubRegex.test(text)) {
+                        if (el.offsetParent !== null || el.getBoundingClientRect().height > 0) {
+                            el.click();
+                            dismissed = true;
+                            break;
+                        }
+                    }
+                } catch (e) {}
+            }
+        }
+
+        // Check shadow roots
+        if (!dismissed) {
+            try {
+                for (const host of document.querySelectorAll('*')) {
+                    if (host.shadowRoot) {
+                        const btn = host.shadowRoot.querySelector('button[data-testid="uc-accept-all-button"], button#accept, button.accept, [data-testid="uc-accept-all-button"]');
+                        if (btn) {
+                            btn.click();
+                            dismissed = true;
+                            break;
+                        }
+                    }
+                }
+            } catch (e) {}
+        }
+
+        // Force remove persistent overlays/backdrops so they don't cover the real description
+        const bannerSelectors = [
+            '#onetrust-consent-sdk',
+            '#onetrust-banner-sdk',
+            '#CybotCookiebotDialog',
+            '.osano-cm-window',
+            '.didomi-popup-container',
+            '[id*="cookie-banner" i]',
+            '[class*="cookie-banner" i]',
+            '[id*="cookie-notice" i]',
+            '[class*="cookie-notice" i]',
+            '[id*="cookie-consent" i]',
+            '[class*="cookie-consent" i]',
+            '[id*="consent-banner" i]',
+            '[class*="consent-banner" i]',
+            '.cky-consent-container'
+        ];
+        for (const bSel of bannerSelectors) {
+            try {
+                document.querySelectorAll(bSel).forEach(bEl => {
+                    bEl.remove();
+                    dismissed = true;
+                });
+            } catch (e) {}
+        }
+
+        try {
+            if (document.body) {
+                document.body.style.overflow = 'auto';
+                document.body.classList.remove('modal-open', 'no-scroll', 'ot-modal-open');
+            }
+            if (document.documentElement) {
+                document.documentElement.style.overflow = 'auto';
+            }
+        } catch (e) {}
+
+        return dismissed;
+    }"""
+    try:
+        page.evaluate(dismiss_js)
+    except Exception:
+        pass
+
+    pw_selectors = [
+        "button:has-text('Accept all cookies')",
+        "button:has-text('Accept All Cookies')",
+        "button:has-text('Accept all')",
+        "button:has-text('Accept All')",
+        "button:has-text('Accept Cookies')",
+        "button:has-text('Allow all cookies')",
+        "button:has-text('Allow All')",
+        "button:has-text('I Agree')",
+        "button:has-text('I agree')",
+        "button:has-text('Got it')",
+        "button:has-text('Dismiss')",
+    ]
+    for sel in pw_selectors:
+        try:
+            loc = page.locator(sel).first
+            if loc.is_visible(timeout=400):
+                loc.click(timeout=1000)
+                time.sleep(0.5)
+                break
+        except Exception:
+            pass
+
+
 def read_description(page):
-    """Description text of the page that is open: JSON-LD first, then the main text block."""
+    """Description text of the page that is open: dismiss overlays first, then JSON-LD, then the main text block."""
+    dismiss_overlays(page)
     candidates = []
     try:
         candidates.append(description_from_jsonld(page.evaluate(JSONLD_JS)))
@@ -526,7 +792,18 @@ def read_description(page):
         candidates.append(page.evaluate(BLOCK_JS))
     except Exception:
         pass
-    return pick_description(candidates)
+    desc = pick_description(candidates)
+
+    if not desc or looks_like_cookie_banner(desc):
+        try:
+            dismiss_overlays(page)
+            time.sleep(1)
+            candidates.append(page.evaluate(BLOCK_JS))
+            desc = pick_description(candidates)
+        except Exception:
+            pass
+
+    return desc
 
 
 def connect_sheet():
