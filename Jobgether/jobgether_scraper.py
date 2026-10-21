@@ -18,16 +18,17 @@ import re
 import os
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import date
+from datetime import datetime, date
 
-TAG = "JG"
+PLATFORM_NAME = "Jobgether"
 _T0 = time.time()
 STATS = {"cards": 0, "fresh": 0, "dup": 0, "skip": 0, "saved": 0, "bad": 0, "status": "ok"}
 
 
 def log(level, msg):
-    """One log line: [platform] +seconds-since-start LEVEL message (the launcher adds the clock time)."""
-    print(f"[{TAG}] +{time.time() - _T0:5.1f}s {level:<5} {msg}", flush=True)
+    """Standard log line: YYYY-MM-DD HH:MM:SS [PLATFORM] [LEVEL] Message"""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{now_str} [{PLATFORM_NAME}] [{level:<5}] {msg}", flush=True)
 
 
 def short(url):
@@ -42,8 +43,12 @@ def jid(link):
 
 
 def summary():
-    log("SUM", f"status={STATS['status']} cards={STATS['cards']} fresh={STATS['fresh']} dup={STATS['dup']} "
-               f"skip={STATS['skip']} saved={STATS['saved']} bad={STATS['bad']} elapsed={time.time() - _T0:.0f}s")
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    elapsed = int(time.time() - _T0)
+    print(f"\n{'='*70}\n{now_str} [{PLATFORM_NAME}] Run Completed (Elapsed: {elapsed}s)\n"
+          f"Status: {STATS['status']} | Scanned: {STATS['cards']} | Fresh (24h): {STATS['fresh']} | "
+          f"Saved: {STATS['saved']} | Duplicates: {STATS['dup']} | Skipped: {STATS['skip']} | Failed: {STATS['bad']}\n"
+          f"{'='*70}\n", flush=True)
 
 if getattr(sys, 'frozen', False):
     CURRENT_DIR = os.path.dirname(sys.executable)
@@ -64,7 +69,7 @@ PROFILE_DIR = os.path.join(CURRENT_DIR, "profiles", "jobgether_profile")
 import os
 from dotenv import load_dotenv
 load_dotenv(os.path.join(LAUNCHER_DIR, ".env"))
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1Kva2y5-54LXBWMTzNk_xp524ZE7N-CWiqL3VGATUZVM")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 SERVICE_ACCOUNT_FILE = os.path.join(LAUNCHER_DIR, "service_account.json")
 
 
@@ -72,6 +77,9 @@ def get_google_sheet():
     """Connect to Sheet1 of the shared Google Sheet. Returns None (and prints why)
     if the service account file is missing or the connection fails, so the
     scraper can keep running and just skip the Sheets sync."""
+    if not GOOGLE_SHEET_ID:
+        log("WARN", "Google Sheets sync disabled: GOOGLE_SHEET_ID not set in .env")
+        return None
     if not os.path.exists(SERVICE_ACCOUNT_FILE):
         log("WARN", "Google Sheets sync disabled: service account file not found")
         return None
@@ -108,10 +116,12 @@ def ensure_header(worksheet):
 
 
 def load_seen_links(worksheet):
-    """Application links already logged in the sheet (column F, 'Job Link'),
+    """Application links already logged in the sheet ('Job Link' column),
     used to skip a job only if this exact link was already added before."""
     try:
-        link_col = worksheet.col_values(6)
+        headers = [h.strip().lower() for h in worksheet.row_values(1)]
+        col_idx = headers.index("job link") + 1 if "job link" in headers else 6
+        link_col = worksheet.col_values(col_idx)
     except Exception as e:
         log("WARN", f"could not read existing job links from the sheet: {e}")
         return set()
@@ -119,14 +129,14 @@ def load_seen_links(worksheet):
 
 
 def load_seen_jobs(worksheet):
-    """(Company, Job Title) pairs already in the sheet (columns B and C),
-    normalized for case/whitespace. The same real job posted on Glassdoor,
-    Hiring Cafe, and Jobgether gets a different apply link on each platform,
-    so load_seen_links() alone can't catch that - this catches it by what
-    the job actually is instead of by its (platform-specific) link."""
+    """(Company, Job Title) pairs already in the sheet,
+    normalized for case/whitespace. Finds columns dynamically by header names."""
     try:
-        company_col = worksheet.col_values(2)
-        title_col = worksheet.col_values(3)
+        headers = [h.strip().lower() for h in worksheet.row_values(1)]
+        c_idx = headers.index("company name") + 1 if "company name" in headers else 2
+        t_idx = headers.index("job title") + 1 if "job title" in headers else 3
+        company_col = worksheet.col_values(c_idx)
+        title_col = worksheet.col_values(t_idx)
     except Exception as e:
         log("WARN", f"could not read existing company/title pairs from the sheet: {e}")
         return set()
@@ -137,6 +147,93 @@ def load_seen_jobs(worksheet):
         if company and title:
             seen.add((company, title))
     return seen
+
+
+OFFLINE_EXCEL = "jobgether_offline.xlsx"
+
+
+def save_offline_job(job):
+    """Saves a job locally to jobgether_offline.xlsx only when Google Sheets is unreachable."""
+    try:
+        import openpyxl
+        if os.path.exists(OFFLINE_EXCEL):
+            wb = openpyxl.load_workbook(OFFLINE_EXCEL)
+            ws = wb.active
+        else:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "OfflineJobs"
+            ws.append(["company", "title", "location", "age", "link", "platform", "description"])
+        
+        ws.append([
+            job.get("company", ""), job.get("title", ""), job.get("location", ""),
+            job.get("age", ""), job.get("link", ""), job.get("platform", "Jobgether"),
+            job.get("description", "")
+        ])
+        wb.save(OFFLINE_EXCEL)
+        log("INFO", f"[Offline Cache] Saved {job.get('company')} | {job.get('title')} to {OFFLINE_EXCEL}")
+    except Exception as e:
+        log("ERR", f"[Offline Cache Error] Could not save to {OFFLINE_EXCEL}: {e}")
+
+
+def sync_offline_jobs(sheet, seen_links, seen_jobs):
+    """Syncs any locally cached offline jobs to Google Sheets once connection is available."""
+    if not sheet or not os.path.exists(OFFLINE_EXCEL):
+        return
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(OFFLINE_EXCEL)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if len(rows) <= 1:
+            try:
+                os.remove(OFFLINE_EXCEL)
+            except Exception:
+                pass
+            return
+
+        headers = [str(h).strip().lower() for h in rows[0]]
+        h_map = {h: i for i, h in enumerate(headers)}
+        synced_count = 0
+        remaining_rows = [rows[0]]
+
+        for r in rows[1:]:
+            company = r[h_map.get("company", 0)] or ""
+            title = r[h_map.get("title", 1)] or ""
+            location = r[h_map.get("location", 2)] or ""
+            age = r[h_map.get("age", 3)] or ""
+            link = r[h_map.get("link", 4)] or ""
+            platform = r[h_map.get("platform", 5)] or "Jobgether"
+            description = r[h_map.get("description", 6)] or ""
+
+            job_dict = {
+                "company": str(company), "title": str(title), "location": str(location),
+                "age": str(age), "link": str(link), "platform": str(platform),
+                "description": str(description)
+            }
+            if append_job(sheet, job_dict, seen_links, seen_jobs, is_offline_sync=True):
+                synced_count += 1
+            else:
+                remaining_rows.append(r)
+
+        if synced_count > 0:
+            log("INFO", f"[Offline Sync] Successfully synced {synced_count} offline job(s) to Google Sheets!")
+
+        if len(remaining_rows) <= 1:
+            wb.close()
+            try:
+                os.remove(OFFLINE_EXCEL)
+            except Exception:
+                pass
+        else:
+            new_wb = openpyxl.Workbook()
+            new_ws = new_wb.active
+            new_ws.title = "OfflineJobs"
+            for r in remaining_rows:
+                new_ws.append(list(r))
+            new_wb.save(OFFLINE_EXCEL)
+    except Exception as e:
+        log("WARN", f"[Offline Sync Warning] Error while syncing {OFFLINE_EXCEL}: {e}")
 
 
 CAPTCHA_INDICATORS = [
@@ -237,9 +334,33 @@ def clean_description(text):
     return s
 
 
+COOKIE_PATTERNS = [
+    re.compile(r"we use cookies", re.IGNORECASE),
+    re.compile(r"cookie policy", re.IGNORECASE),
+    re.compile(r"cookie preferences", re.IGNORECASE),
+    re.compile(r"accept all cookies", re.IGNORECASE),
+    re.compile(r"by clicking [\"']?accept[\"']?", re.IGNORECASE),
+    re.compile(r"privacy policy.*cookies", re.IGNORECASE),
+    re.compile(r"manage preferences", re.IGNORECASE),
+]
+
+
+def looks_like_cookie_banner(text):
+    """Returns True if the text is predominantly a cookie/GDPR consent notice."""
+    t = text.strip()
+    if len(t) < 1500:
+        matches = sum(1 for p in COOKIE_PATTERNS if p.search(t))
+        if matches >= 2:
+            return True
+        if len(t) < 600 and ("cookie" in t.lower() or "consent" in t.lower()):
+            return True
+    return False
+
+
 def pick_description(candidates):
-    """First candidate with at least 400 characters, else the longest non-empty one."""
-    texts = [t for t in (clean_description(c) for c in candidates if c) if t]
+    """First candidate with at least 400 characters, else the longest non-empty one.
+    Ignores candidates that are just cookie banners or privacy consent popups."""
+    texts = [t for t in (clean_description(c) for c in candidates if c) if t and not looks_like_cookie_banner(t)]
     for t in texts:
         if len(t) >= 400:
             return t
@@ -264,7 +385,7 @@ def row_problem(job):
     return ""
 
 
-def append_job(sheet, job, seen_links, seen_jobs):
+def append_job(sheet, job, seen_links, seen_jobs, is_offline_sync=False):
     """Append one job to the sheet. Google picks the next free row, so scrapers running
     at the same time cannot overwrite each other. Skips duplicates and incomplete jobs.
     Returns True if the row was written."""
@@ -285,11 +406,37 @@ def append_job(sheet, job, seen_links, seen_jobs):
         log("SKIP", f"{who}: {problem}")
         return False
     description = clean_description(job.get("description", ""))
-    row = [
-        "=ROW()-1", job["company"], job["title"], job["location"], job["age"],
-        make_link_formula(link), date.today().strftime("%m/%d/%Y"), job["platform"],
-        description,
-    ]
+    
+    # Dynamically map values to header columns so extra or moved columns never break alignment
+    try:
+        headers = [h.strip().lower() for h in sheet.row_values(1)]
+    except Exception:
+        headers = []
+
+    if headers:
+        col_map = {h: i for i, h in enumerate(headers)}
+        row = [""] * len(headers)
+        
+        def set_val(name, val):
+            if name in col_map:
+                row[col_map[name]] = val
+
+        set_val("no.", "=ROW()-1")
+        set_val("company name", job["company"])
+        set_val("job title", job["title"])
+        set_val("location", job["location"])
+        set_val("job age", job["age"])
+        set_val("job link", make_link_formula(link))
+        set_val("date posted", date.today().strftime("%m/%d/%Y"))
+        set_val("platform", job["platform"])
+        set_val("job description", description)
+    else:
+        row = [
+            "=ROW()-1", job["company"], job["title"], job["location"], job["age"],
+            make_link_formula(link), date.today().strftime("%m/%d/%Y"), job["platform"],
+            description,
+        ]
+
     for attempt in range(3):
         try:
             sheet.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
@@ -307,8 +454,53 @@ def append_job(sheet, job, seen_links, seen_jobs):
     return False
 
 
+async def dismiss_overlays(page):
+    """Dismiss common cookie consent dialogs, popups, and GDPR modals if present."""
+    dismiss_js = """() => {
+        const selectors = [
+            'button#onetrust-accept-btn-handler',
+            'button#onetrust-reject-all-handler',
+            'button.onetrust-close-btn-handler',
+            '#onetrust-banner-sdk button',
+            'button[id*="cookie" i]',
+            'button[class*="cookie" i]',
+            'button[aria-label*="cookie" i]',
+            'button[aria-label="Close" i]',
+            'button[aria-label="close" i]',
+            'button:has-text("Accept All")',
+            'button:has-text("Accept all")',
+            'button:has-text("Accept Cookies")',
+            'button:has-text("Accept cookies")',
+            'button:has-text("Allow All")',
+            'button:has-text("Allow Cookies")',
+            'button:has-text("I Agree")',
+            'button:has-text("I agree")',
+            'button:has-text("Got it")',
+            'button:has-text("Dismiss")',
+            'button:has-text("Close")',
+            '.modal-close',
+            '.popup-close'
+        ];
+        for (const s of selectors) {
+            try {
+                const btn = document.querySelector(s);
+                if (btn && btn.offsetParent !== null) {
+                    btn.click();
+                    return true;
+                }
+            } catch (e) {}
+        }
+        return false;
+    }"""
+    try:
+        await page.evaluate(dismiss_js)
+    except Exception:
+        pass
+
+
 async def read_description(page):
-    """Description text of the page that is open: JSON-LD first, then the main text block."""
+    """Description text of the page that is open: dismiss overlays first, then JSON-LD, then main text block."""
+    await dismiss_overlays(page)
     candidates = []
     try:
         candidates.append(description_from_jsonld(await page.evaluate(JSONLD_JS)))
@@ -336,7 +528,7 @@ def is_within_24h(age_text):
     text = str(age_text or "").lower().strip()
     if not text:
         return False
-    if "just now" in text or "today" in text or text == "now":
+    if "just now" in text or "just posted" in text or "today" in text or text == "now":
         return True
     match = re.search(r"(\d+)\+?\s*(d|days?|h|hrs?|hours?|m|mins?|minutes?)\b", text)
     if not match:
@@ -398,6 +590,7 @@ async def main():
     )
 
     results = []
+    log("INFO", f"=== Starting Jobgether Scraper | Keyword: '{keyword}' | Location: '{location_slug}' ===")
 
     async with async_playwright() as p:
         # Launch our own stealth-patched Chrome (same patchright approach
@@ -477,7 +670,7 @@ async def main():
                     if (postedCard) {
                         const fullText = postedCard.innerText;
                         const lower = fullText.toLowerCase();
-                        if (lower.includes("just now")) {
+                        if (lower.includes("just now") || lower.includes("just posted")) {
                             posted = "Just Now";
                         } else if (lower.includes("today")) {
                             posted = "Today";
@@ -528,6 +721,12 @@ async def main():
                 sheet, seen_links, seen_jobs = None, set(), set()
             log("INFO", f"duplicate check loaded: {len(seen_links)} links, {len(seen_jobs)} company/title pairs")
 
+            if sheet:
+                try:
+                    await asyncio.to_thread(sync_offline_jobs, sheet, seen_links, seen_jobs)
+                except Exception as sync_e:
+                    log("WARN", f"Could not sync cached offline jobs: {sync_e}")
+
             sem = asyncio.Semaphore(JOB_CONCURRENCY)
             write_lock = asyncio.Lock()
 
@@ -575,23 +774,22 @@ async def main():
 
                         if apply_link:
                             job_data = {
-                                "Job Title": card["title"],
-                                "Company": card["company"],
-                                "Job Age": card["posted"],
-                                "Location": "United States",
-                                "Apply Link": apply_link,
+                                "company": card["company"], "title": card["title"], "location": "United States",
+                                "age": card["posted"], "link": apply_link, "platform": "Jobgether",
+                                "description": description,
                             }
-                            results.append(job_data)
+                            written = False
                             if sheet:
-                                # one write at a time: the duplicate check, the append and the seen_* update stay together
                                 async with write_lock:
-                                    await asyncio.to_thread(append_job, sheet, {
-                                        "company": card["company"], "title": card["title"], "location": "United States",
-                                        "age": card["posted"], "link": apply_link, "platform": "Jobgether",
-                                        "description": description,
-                                    }, seen_links, seen_jobs)
-                            else:
-                                log("WARN", f"{who}: sheet not connected; only in jobgether.xlsx")
+                                    written = await asyncio.to_thread(append_job, sheet, job_data, seen_links, seen_jobs)
+                            if not written:
+                                # Save to offline cache if Google Sheet write failed or sheet was disconnected
+                                save_offline_job(job_data)
+                                results.append({
+                                    "Job Title": card["title"], "Company": card["company"],
+                                    "Job Age": card["posted"], "Location": "United States",
+                                    "Apply Link": apply_link,
+                                })
                     except Exception as e:
                         STATS["bad"] += 1
                         log("ERR", f"{jid(card['href'])}  error while processing the job: {str(e)[:150]}")
@@ -605,16 +803,7 @@ async def main():
             log("INFO", f"phase=extract {len(fresh_cards)} jobs, {JOB_CONCURRENCY} at a time")
             await asyncio.gather(*(process(c) for c in fresh_cards), return_exceptions=True)
 
-            # Save to Excel - one fixed filename overwritten each run (same
-            # as Glassdoor's glassdoor.xlsx and Hiring Cafe's jobs.xlsx),
-            # not a new timestamped file every run - this used to pile up
-            # one file per keyword per run with no cleanup, since the Google
-            # Sheet above is the actual persistent destination and this is
-            # just a local backup snapshot of the latest run.
-            df = pd.DataFrame(results)
-            excel_file = "jobgether.xlsx"
-            df.to_excel(excel_file, index=False)
-            log("INFO", f"done: {STATS['saved']} rows written to the sheet, {len(results)} jobs in {excel_file}")
+            log("INFO", f"done: {STATS['saved']} rows written directly to Google Sheets")
             summary()
 
         finally:

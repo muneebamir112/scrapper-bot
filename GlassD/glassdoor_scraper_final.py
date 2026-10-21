@@ -19,19 +19,20 @@ import sys
 import re
 import time
 from urllib.parse import urlparse
-from datetime import date
+from datetime import datetime, date
 from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
-TAG = "GD"
+PLATFORM_NAME = "Glassdoor"
 _T0 = time.time()
 STATS = {"cards": 0, "dup": 0, "skip": 0, "saved": 0, "bad": 0, "status": "ok"}
 SKIPS = {}  # why jobs were skipped: reason key -> count
 
 
 def log(level, msg):
-    """One log line: [platform] +seconds-since-start LEVEL message (the launcher adds the clock time)."""
-    print(f"[{TAG}] +{time.time() - _T0:5.1f}s {level:<5} {msg}", flush=True)
+    """Standard log line: YYYY-MM-DD HH:MM:SS [PLATFORM] [LEVEL] Message"""
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{now_str} [{PLATFORM_NAME}] [{level:<5}] {msg}", flush=True)
 
 
 def short(url):
@@ -47,10 +48,14 @@ def skip(who, key, text):
 
 
 def summary():
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    elapsed = int(time.time() - _T0)
     why = " ".join(f"{k}={v}" for k, v in SKIPS.items())
-    log("SUM", f"status={STATS['status']} cards={STATS['cards']} dup={STATS['dup']} skip={STATS['skip']}"
-               f"{' (' + why + ')' if why else ''} saved={STATS['saved']} bad={STATS['bad']} "
-               f"elapsed={time.time() - _T0:.0f}s")
+    skip_detail = f" ({why})" if why else ""
+    print(f"\n{'='*70}\n{now_str} [{PLATFORM_NAME}] Run Completed (Elapsed: {elapsed}s)\n"
+          f"Status: {STATS['status']} | Scanned Cards: {STATS['cards']} | "
+          f"Saved: {STATS['saved']} | Duplicates: {STATS['dup']} | Skipped: {STATS['skip']}{skip_detail} | Failed: {STATS['bad']}\n"
+          f"{'='*70}\n", flush=True)
 
 if getattr(sys, 'frozen', False):
     CURRENT_DIR = os.path.dirname(sys.executable)
@@ -63,7 +68,7 @@ else:
 PROFILE_DIR = os.path.join(CURRENT_DIR, "profiles", "glassdoor_profile")
 
 load_dotenv(os.path.join(LAUNCHER_DIR, ".env"))
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "1Kva2y5-54LXBWMTzNk_xp524ZE7N-CWiqL3VGATUZVM")
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID", "").strip()
 SERVICE_ACCOUNT_FILE = os.path.join(LAUNCHER_DIR, "service_account.json")
 EXCEL_HEADER = ["Company", "Job Title", "Location", "Job Age", "Application Link"]
 
@@ -71,6 +76,9 @@ def get_google_sheet():
     """Connect to the configured Google Sheet's first worksheet. Returns None (and
     prints why) if the service account file is missing or the connection fails, so
     the scraper can keep running and just skip the Sheets sync."""
+    if not GOOGLE_SHEET_ID:
+        log("WARN", "Google Sheets sync disabled: GOOGLE_SHEET_ID not set in .env")
+        return None
     if not os.path.exists(SERVICE_ACCOUNT_FILE):
         log("WARN", "Google Sheets sync disabled: service account file not found")
         return None
@@ -106,26 +114,28 @@ def ensure_header(worksheet):
 
 
 def load_seen_links(worksheet):
-    """Application links already logged in the Google Sheet (column F, 'Job Link').
+    """Application links already logged in the Google Sheet ('Job Link' column).
     Used to skip a job only if this exact link was already added in a past run or
     earlier in the current one — multiple postings from the same company are fine
     as long as each has its own link."""
     try:
-        link_col = worksheet.col_values(6)
+        headers = [h.strip().lower() for h in worksheet.row_values(1)]
+        col_idx = headers.index("job link") + 1 if "job link" in headers else 6
+        link_col = worksheet.col_values(col_idx)
     except Exception as e:
         log("WARN", f"could not read existing job links from the sheet: {e}")
         return set()
     return {v.strip() for v in link_col[1:] if v.strip()}
 
 def load_seen_jobs(worksheet):
-    """(Company, Job Title) pairs already in the sheet (columns B and C),
-    normalized for case/whitespace. The same real job posted on Glassdoor,
-    Hiring Cafe, and Jobgether gets a different apply link on each platform,
-    so load_seen_links() alone can't catch that - this catches it by what
-    the job actually is instead of by its (platform-specific) link."""
+    """(Company, Job Title) pairs already in the sheet,
+    normalized for case/whitespace. Finds columns dynamically by header names."""
     try:
-        company_col = worksheet.col_values(2)
-        title_col = worksheet.col_values(3)
+        headers = [h.strip().lower() for h in worksheet.row_values(1)]
+        c_idx = headers.index("company name") + 1 if "company name" in headers else 2
+        t_idx = headers.index("job title") + 1 if "job title" in headers else 3
+        company_col = worksheet.col_values(c_idx)
+        title_col = worksheet.col_values(t_idx)
     except Exception as e:
         log("WARN", f"could not read existing company/title pairs from the sheet: {e}")
         return set()
@@ -136,6 +146,93 @@ def load_seen_jobs(worksheet):
         if company and title:
             seen.add((company, title))
     return seen
+
+
+OFFLINE_EXCEL = "glassdoor_offline.xlsx"
+
+
+def save_offline_job(job):
+    """Saves a job locally to glassdoor_offline.xlsx only when Google Sheets is unreachable."""
+    try:
+        import openpyxl
+        if os.path.exists(OFFLINE_EXCEL):
+            wb = openpyxl.load_workbook(OFFLINE_EXCEL)
+            ws = wb.active
+        else:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "OfflineJobs"
+            ws.append(["company", "title", "location", "age", "link", "platform", "description"])
+        
+        ws.append([
+            job.get("company", ""), job.get("title", ""), job.get("location", ""),
+            job.get("age", ""), job.get("link", ""), job.get("platform", "Glassdoor"),
+            job.get("description", "")
+        ])
+        wb.save(OFFLINE_EXCEL)
+        log("INFO", f"[Offline Cache] Saved {job.get('company')} | {job.get('title')} to {OFFLINE_EXCEL}")
+    except Exception as e:
+        log("ERR", f"[Offline Cache Error] Could not save to {OFFLINE_EXCEL}: {e}")
+
+
+def sync_offline_jobs(sheet, seen_links, seen_jobs):
+    """Syncs any locally cached offline jobs to Google Sheets once connection is available."""
+    if not sheet or not os.path.exists(OFFLINE_EXCEL):
+        return
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(OFFLINE_EXCEL)
+        ws = wb.active
+        rows = list(ws.iter_rows(values_only=True))
+        if len(rows) <= 1:
+            try:
+                os.remove(OFFLINE_EXCEL)
+            except Exception:
+                pass
+            return
+
+        headers = [str(h).strip().lower() for h in rows[0]]
+        h_map = {h: i for i, h in enumerate(headers)}
+        synced_count = 0
+        remaining_rows = [rows[0]]
+
+        for r in rows[1:]:
+            company = r[h_map.get("company", 0)] or ""
+            title = r[h_map.get("title", 1)] or ""
+            location = r[h_map.get("location", 2)] or ""
+            age = r[h_map.get("age", 3)] or ""
+            link = r[h_map.get("link", 4)] or ""
+            platform = r[h_map.get("platform", 5)] or "Glassdoor"
+            description = r[h_map.get("description", 6)] or ""
+
+            job_dict = {
+                "company": str(company), "title": str(title), "location": str(location),
+                "age": str(age), "link": str(link), "platform": str(platform),
+                "description": str(description)
+            }
+            if append_job(sheet, job_dict, seen_links, seen_jobs, is_offline_sync=True):
+                synced_count += 1
+            else:
+                remaining_rows.append(r)
+
+        if synced_count > 0:
+            log("INFO", f"[Offline Sync] Successfully synced {synced_count} offline job(s) to Google Sheets!")
+
+        if len(remaining_rows) <= 1:
+            wb.close()
+            try:
+                os.remove(OFFLINE_EXCEL)
+            except Exception:
+                pass
+        else:
+            new_wb = openpyxl.Workbook()
+            new_ws = new_wb.active
+            new_ws.title = "OfflineJobs"
+            for r in remaining_rows:
+                new_ws.append(list(r))
+            new_wb.save(OFFLINE_EXCEL)
+    except Exception as e:
+        log("WARN", f"[Offline Sync Warning] Error while syncing {OFFLINE_EXCEL}: {e}")
 
 def parse_job_age(age_text):
     """Convert job age text to numeric days for comparison."""
@@ -332,7 +429,7 @@ def row_problem(job):
     return ""
 
 
-def append_job(sheet, job, seen_links, seen_jobs):
+def append_job(sheet, job, seen_links, seen_jobs, is_offline_sync=False):
     """Append one job to the sheet. Google picks the next free row, so scrapers running
     at the same time cannot overwrite each other. Skips duplicates and incomplete jobs.
     Returns True if the row was written."""
@@ -351,11 +448,37 @@ def append_job(sheet, job, seen_links, seen_jobs):
         skip(who, "incomplete", problem)
         return False
     description = clean_description(job.get("description", ""))
-    row = [
-        "=ROW()-1", job["company"], job["title"], job["location"], job["age"],
-        make_link_formula(link), date.today().strftime("%m/%d/%Y"), job["platform"],
-        description,
-    ]
+    
+    # Dynamically map values to header columns so extra or moved columns never break alignment
+    try:
+        headers = [h.strip().lower() for h in sheet.row_values(1)]
+    except Exception:
+        headers = []
+
+    if headers:
+        col_map = {h: i for i, h in enumerate(headers)}
+        row = [""] * len(headers)
+        
+        def set_val(name, val):
+            if name in col_map:
+                row[col_map[name]] = val
+
+        set_val("no.", "=ROW()-1")
+        set_val("company name", job["company"])
+        set_val("job title", job["title"])
+        set_val("location", job["location"])
+        set_val("job age", job["age"])
+        set_val("job link", make_link_formula(link))
+        set_val("date posted", date.today().strftime("%m/%d/%Y"))
+        set_val("platform", job["platform"])
+        set_val("job description", description)
+    else:
+        row = [
+            "=ROW()-1", job["company"], job["title"], job["location"], job["age"],
+            make_link_formula(link), date.today().strftime("%m/%d/%Y"), job["platform"],
+            description,
+        ]
+
     for attempt in range(3):
         try:
             sheet.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
@@ -435,7 +558,7 @@ def main():
     # (jobs are pushed there live, row by row, as they're scraped). The thread is finished before
     # the first row is written, so the sheet is never used by two threads at once.
     sheet_future = ThreadPoolExecutor(max_workers=1).submit(connect_sheet)
-    log("INFO", f"phase=start keyword='{job_title}' location='{location}'")
+    log("INFO", f"=== Starting Glassdoor Scraper | Keyword: '{job_title}' | Location: '{location}' ===")
 
     # Launch stealth browser (real Chrome, persistent profile)
     os.makedirs(PROFILE_DIR, exist_ok=True)
@@ -625,6 +748,12 @@ def main():
             sheet, seen_links, seen_jobs = sheet_future.result()
             log("INFO", f"duplicate check loaded: {len(seen_links)} links, {len(seen_jobs)} company/title pairs")
 
+            if sheet:
+                try:
+                    sync_offline_jobs(sheet, seen_links, seen_jobs)
+                except Exception as sync_e:
+                    log("WARN", f"Could not sync cached offline jobs: {sync_e}")
+
             # Step 8: Process all jobs
             processed = 0
             for idx, card in enumerate(job_cards, 1):
@@ -793,15 +922,15 @@ def main():
                         job_page.close()
                         continue
 
-                    saved = True
-                    if not sheet:
-                        log("WARN", f"{who}: sheet not connected; only in glassdoor.xlsx")
+                    saved = False
+                    job_dict = {
+                        "company": company, "title": job_t, "location": loc, "age": job_age,
+                        "link": app_url, "platform": "Glassdoor", "description": description,
+                    }
                     if sheet:
-                        saved = append_job(sheet, {
-                            "company": company, "title": job_t, "location": loc, "age": job_age,
-                            "link": app_url, "platform": "Glassdoor", "description": description,
-                        }, seen_links, seen_jobs)
-                    if saved:
+                        saved = append_job(sheet, job_dict, seen_links, seen_jobs)
+                    if not saved:
+                        save_offline_job(job_dict)
                         ws.append([company, job_t, loc, job_age, app_url])
                         processed += 1
                     job_page.close()
@@ -827,9 +956,7 @@ def main():
                                 pass
                     continue
             
-            # Save Excel
-            wb.save("glassdoor.xlsx")
-            log("INFO", f"done: {STATS['saved']} rows written to the sheet, {processed} jobs in glassdoor.xlsx")
+            log("INFO", f"done: {STATS['saved']} rows written directly to Google Sheets")
             
         except Exception as e:
             log("ERR", f"fatal: {str(e)[:200]}")
