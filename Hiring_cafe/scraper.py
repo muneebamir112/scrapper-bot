@@ -57,6 +57,9 @@ else:
     BASE_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
     LAUNCHER_DIR = os.path.join(BASE_DIR, "Job-bot-launcher")
 
+if LAUNCHER_DIR not in sys.path:
+    sys.path.insert(0, LAUNCHER_DIR)
+
 # Persistent Chrome profile for the stealth browser (same patchright approach
 # GlassD's scraper uses), kept separate from GlassD's own profile so each
 # platform's login/session state stays independent.
@@ -97,13 +100,13 @@ def get_google_sheet():
 
 
 def ensure_header(worksheet):
-    """Create the header row if the tab is empty (column I holds the job description)."""
+    """Create the header row if the tab is empty (columns J & K hold question docs)."""
     company_col = worksheet.col_values(2)
     if len(company_col) == 0 or (len(company_col) == 1 and not company_col[0].strip()):
-        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform", "Job Description"]
-        worksheet.update(range_name="A1:I1", values=[headers], value_input_option="USER_ENTERED")
+        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform", "Job Description", "Questions Doc Link", "Questions Count"]
+        worksheet.update(range_name="A1:K1", values=[headers], value_input_option="USER_ENTERED")
         try:
-            worksheet.format("A1:I1", {
+            worksheet.format("A1:K1", {
                 "backgroundColor": {"red": 0.99, "green": 0.89, "blue": 0.58},
                 "textFormat": {"bold": True, "fontSize": 10},
                 "horizontalAlignment": "CENTER",
@@ -111,6 +114,18 @@ def ensure_header(worksheet):
             worksheet.format("I2:I", {"numberFormat": {"type": "TEXT"}, "wrapStrategy": "CLIP"})
         except Exception as e:
             log("WARN", f"could not format headers: {e}")
+    else:
+        try:
+            existing_headers = worksheet.row_values(1)
+            if len(existing_headers) < 10:
+                worksheet.update(range_name="J1:K1", values=[["Questions Doc Link", "Questions Count"]], value_input_option="USER_ENTERED")
+                worksheet.format("J1:K1", {
+                    "backgroundColor": {"red": 0.99, "green": 0.89, "blue": 0.58},
+                    "textFormat": {"bold": True, "fontSize": 10},
+                    "horizontalAlignment": "CENTER",
+                })
+        except Exception:
+            pass
 
 
 def load_seen_links(worksheet):
@@ -258,9 +273,9 @@ def is_within_24h(age_text):
 
 CAPTCHA_INDICATORS = [
     "captcha", "recaptcha", "hcaptcha", "are you a robot", "are-you-a-robot",
-    "cloudflare", "checking your browser", "verify you are human",
-    "unusual traffic", "access denied", "attention required", "bot detection",
-    "please verify", "security check", "just a moment",
+    "cloudflare", "verify you are human", "unusual traffic", "access denied", 
+    "attention required", "bot detection", "please verify", "security check",
+    "verify your identity"
 ]
 
 
@@ -555,7 +570,10 @@ def append_job(sheet, job, seen_links, seen_jobs, is_offline_sync=False):
         log("SKIP", f"{who}: {problem}")
         return False
     description = clean_description(job.get("description", ""))
-    
+    questions_doc = job.get("questions_doc", "")
+    questions_count = job.get("questions_count", "None")
+    doc_cell = make_link_formula(questions_doc) if questions_doc else ""
+
     # Dynamically map values to header columns so extra or moved columns never break alignment
     try:
         headers = [h.strip().lower() for h in sheet.row_values(1)]
@@ -579,13 +597,14 @@ def append_job(sheet, job, seen_links, seen_jobs, is_offline_sync=False):
         set_val("date posted", date.today().strftime("%m/%d/%Y"))
         set_val("platform", job["platform"])
         set_val("job description", description)
+        set_val("questions doc link", doc_cell)
+        set_val("questions count", questions_count)
     else:
         row = [
             "=ROW()-1", job["company"], job["title"], job["location"], job["age"],
             make_link_formula(link), date.today().strftime("%m/%d/%Y"), job["platform"],
-            description,
+            description, doc_cell, questions_count
         ]
-
     for attempt in range(3):
         try:
             sheet.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
@@ -719,12 +738,8 @@ async def main():
         
         for attempt in range(4):
             try:
-                log("INFO", "clearing stored site settings")
-                await page.goto("https://hiringcafe.com/", wait_until="domcontentloaded", timeout=60000)
-                await page.evaluate("window.localStorage.clear(); window.sessionStorage.clear();")
-
                 log("INFO", f"phase=search keyword='{keyword}' location='{location}' remote=True")
-                await page.goto(search_url, wait_until="domcontentloaded", timeout=60000)
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=35000)
                 try:
                     await page.wait_for_selector('a[href^="/job/"]', timeout=10000)
                 except Exception:
@@ -896,10 +911,14 @@ async def main():
                 "company": job_data["company"], "title": job_data["title"], "location": job_data["location"],
                 "age": job_data["posted"], "link": job_data["apply_link"], "platform": "Hiring Cafe",
                 "description": job_data.get("description", ""),
+                "questions_doc": job_data.get("questions_doc", ""),
+                "questions_count": job_data.get("questions_count", "None"),
             }
             if sheet:
                 async with write_lock:
                     written = await asyncio.to_thread(append_job, sheet, job_dict, seen_links, seen_jobs)
+            else:
+                log("WARN", f"{jid(job_url)}  sheet not connected; {job_data['company']} | {job_data['title']} is only in jobs.xlsx")
 
             if not written:
                 save_offline_job(job_dict)
@@ -917,7 +936,7 @@ async def extract_job_data(context, job_url, age_text, seen_jobs):
     popups = []
     new_page.on("popup", lambda p: popups.append(p))  # Playwright needs a Python function, not a bound builtin
     try:
-        await new_page.goto(job_url, wait_until="domcontentloaded", timeout=60000)
+        await new_page.goto(job_url, wait_until="domcontentloaded", timeout=30000)
 
         # The page is ready once the Apply button is in the page (title and description render with it).
         # It only has to exist: the site keeps hidden duplicate buttons (mobile layout) that sort first.
@@ -1016,6 +1035,19 @@ async def extract_job_data(context, job_url, age_text, seen_jobs):
                 except Exception:
                     candidate_text = ""
                 employer_description = await read_description(popup)
+
+                # IN THE SAME VISIT: Extract questions from popup application form before closing!
+                doc_url, q_count = "", "None"
+                try:
+                    from question_extractor import extract_questions_and_create_doc_async
+                    doc_url, q_count, _ = await extract_questions_and_create_doc_async(
+                        popup, context, company, title, candidate_link
+                    )
+                    if doc_url:
+                        log("INFO", f"[{company} | {title}] Form questions synced: {q_count} -> {doc_url}")
+                except Exception as q_err:
+                    log("WARN", f"In-flight question extraction note: {q_err}")
+
                 try:
                     await popup.close()
                 except Exception:
@@ -1037,6 +1069,19 @@ async def extract_job_data(context, job_url, age_text, seen_jobs):
                     except Exception:
                         candidate_text = ""
                     employer_description = await read_description(new_page)
+
+                    # IN THE SAME VISIT: Extract questions from new_page
+                    doc_url, q_count = "", "None"
+                    try:
+                        from question_extractor import extract_questions_and_create_doc_async
+                        doc_url, q_count, _ = await extract_questions_and_create_doc_async(
+                            new_page, context, company, title, candidate_link
+                        )
+                        if doc_url:
+                            log("INFO", f"[{company} | {title}] Form questions synced: {q_count} -> {doc_url}")
+                    except Exception as q_err:
+                        log("WARN", f"In-flight question extraction note: {q_err}")
+
                     if _is_ready_to_apply(candidate_link, candidate_text):
                         apply_link = candidate_link
                     else:
@@ -1081,7 +1126,9 @@ async def extract_job_data(context, job_url, age_text, seen_jobs):
         description = employer_description if len(employer_description) >= 400 else max(employer_description, board_description, key=len)
         return {"title": title.strip(), "company": company.strip(), "location": job_location.strip(),
                 "posted": posted.strip(), "job_url": job_url, "apply_link": apply_link,
-                "description": description}
+                "description": description,
+                "questions_doc": doc_url if 'doc_url' in locals() else "",
+                "questions_count": q_count if 'q_count' in locals() else "None"}
     except Exception as e:
         STATS["bad"] += 1
         log("ERR", f"{jid(job_url)}  extraction error: {str(e)[:150]}")

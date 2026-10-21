@@ -65,6 +65,9 @@ else:
     BASE_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
     LAUNCHER_DIR = os.path.join(BASE_DIR, "Job-bot-launcher")
 
+if LAUNCHER_DIR not in sys.path:
+    sys.path.insert(0, LAUNCHER_DIR)
+
 PROFILE_DIR = os.path.join(CURRENT_DIR, "profiles", "glassdoor_profile")
 
 load_dotenv(os.path.join(LAUNCHER_DIR, ".env"))
@@ -97,13 +100,13 @@ def get_google_sheet():
         return None
 
 def ensure_header(worksheet):
-    """Create the header row if the tab is empty (column I holds the job description)."""
+    """Create the header row if the tab is empty (columns J & K hold question docs)."""
     company_col = worksheet.col_values(2)
     if len(company_col) == 0 or (len(company_col) == 1 and not company_col[0].strip()):
-        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform", "Job Description"]
-        worksheet.update(range_name="A1:I1", values=[headers], value_input_option="USER_ENTERED")
+        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform", "Job Description", "Questions Doc Link", "Questions Count"]
+        worksheet.update(range_name="A1:K1", values=[headers], value_input_option="USER_ENTERED")
         try:
-            worksheet.format("A1:I1", {
+            worksheet.format("A1:K1", {
                 "backgroundColor": {"red": 0.99, "green": 0.89, "blue": 0.58},
                 "textFormat": {"bold": True, "fontSize": 10},
                 "horizontalAlignment": "CENTER",
@@ -111,6 +114,18 @@ def ensure_header(worksheet):
             worksheet.format("I2:I", {"numberFormat": {"type": "TEXT"}, "wrapStrategy": "CLIP"})
         except Exception as e:
             log("WARN", f"could not format headers: {e}")
+    else:
+        try:
+            existing_headers = worksheet.row_values(1)
+            if len(existing_headers) < 10:
+                worksheet.update(range_name="J1:K1", values=[["Questions Doc Link", "Questions Count"]], value_input_option="USER_ENTERED")
+                worksheet.format("J1:K1", {
+                    "backgroundColor": {"red": 0.99, "green": 0.89, "blue": 0.58},
+                    "textFormat": {"bold": True, "fontSize": 10},
+                    "horizontalAlignment": "CENTER",
+                })
+        except Exception:
+            pass
 
 
 def load_seen_links(worksheet):
@@ -448,7 +463,10 @@ def append_job(sheet, job, seen_links, seen_jobs, is_offline_sync=False):
         skip(who, "incomplete", problem)
         return False
     description = clean_description(job.get("description", ""))
-    
+    questions_doc = job.get("questions_doc", "")
+    questions_count = job.get("questions_count", "None")
+    doc_cell = make_link_formula(questions_doc) if questions_doc else ""
+
     # Dynamically map values to header columns so extra or moved columns never break alignment
     try:
         headers = [h.strip().lower() for h in sheet.row_values(1)]
@@ -472,13 +490,14 @@ def append_job(sheet, job, seen_links, seen_jobs, is_offline_sync=False):
         set_val("date posted", date.today().strftime("%m/%d/%Y"))
         set_val("platform", job["platform"])
         set_val("job description", description)
+        set_val("questions doc link", doc_cell)
+        set_val("questions count", questions_count)
     else:
         row = [
             "=ROW()-1", job["company"], job["title"], job["location"], job["age"],
             make_link_formula(link), date.today().strftime("%m/%d/%Y"), job["platform"],
-            description,
+            description, doc_cell, questions_count
         ]
-
     for attempt in range(3):
         try:
             sheet.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
@@ -922,15 +941,31 @@ def main():
                         job_page.close()
                         continue
 
+                    # IN THE SAME VISIT: Extract questions from job_page before closing it!
+                    doc_url, q_count = "", "None"
+                    try:
+                        from question_extractor import extract_questions_and_create_doc_sync
+                        doc_url, q_count, _ = extract_questions_and_create_doc_sync(
+                            job_page, context, company, job_t, app_url
+                        )
+                        if doc_url:
+                            log("INFO", f"[{company} | {job_t}] Form questions synced: {q_count} -> {doc_url}")
+                    except Exception as q_err:
+                        log("WARN", f"In-flight question extraction note: {q_err}")
+
                     saved = False
                     job_dict = {
                         "company": company, "title": job_t, "location": loc, "age": job_age,
                         "link": app_url, "platform": "Glassdoor", "description": description,
+                        "questions_doc": doc_url, "questions_count": q_count,
                     }
-                    if sheet:
+                    if not sheet:
+                        log("WARN", f"{who}: sheet not connected; only in glassdoor.xlsx")
+                    else:
                         saved = append_job(sheet, job_dict, seen_links, seen_jobs)
                     if not saved:
                         save_offline_job(job_dict)
+                    else:
                         ws.append([company, job_t, loc, job_age, app_url])
                         processed += 1
                     job_page.close()

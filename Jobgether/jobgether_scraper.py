@@ -58,6 +58,9 @@ else:
     BASE_DIR = os.path.dirname(os.path.dirname(CURRENT_DIR))
     LAUNCHER_DIR = os.path.join(BASE_DIR, "Job-bot-launcher")
 
+if LAUNCHER_DIR not in sys.path:
+    sys.path.insert(0, LAUNCHER_DIR)
+
 # Persistent Chrome profile for the stealth browser (same patchright approach
 # GlassD's scraper uses), kept separate from GlassD's/Hiring Cafe's own
 # profiles so each platform's login/session state stays independent.
@@ -99,13 +102,13 @@ def get_google_sheet():
 
 
 def ensure_header(worksheet):
-    """Create the header row if the tab is empty (column I holds the job description)."""
+    """Create the header row if the tab is empty (columns J & K hold question docs)."""
     company_col = worksheet.col_values(2)
     if len(company_col) == 0 or (len(company_col) == 1 and not company_col[0].strip()):
-        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform", "Job Description"]
-        worksheet.update(range_name="A1:I1", values=[headers], value_input_option="USER_ENTERED")
+        headers = ["No.", "Company Name", "Job Title", "Location", "Job Age", "Job Link", "Date Posted", "Platform", "Job Description", "Questions Doc Link", "Questions Count"]
+        worksheet.update(range_name="A1:K1", values=[headers], value_input_option="USER_ENTERED")
         try:
-            worksheet.format("A1:I1", {
+            worksheet.format("A1:K1", {
                 "backgroundColor": {"red": 0.99, "green": 0.89, "blue": 0.58},
                 "textFormat": {"bold": True, "fontSize": 10},
                 "horizontalAlignment": "CENTER",
@@ -113,6 +116,18 @@ def ensure_header(worksheet):
             worksheet.format("I2:I", {"numberFormat": {"type": "TEXT"}, "wrapStrategy": "CLIP"})
         except Exception as e:
             log("WARN", f"could not format headers: {e}")
+    else:
+        try:
+            existing_headers = worksheet.row_values(1)
+            if len(existing_headers) < 10:
+                worksheet.update(range_name="J1:K1", values=[["Questions Doc Link", "Questions Count"]], value_input_option="USER_ENTERED")
+                worksheet.format("J1:K1", {
+                    "backgroundColor": {"red": 0.99, "green": 0.89, "blue": 0.58},
+                    "textFormat": {"bold": True, "fontSize": 10},
+                    "horizontalAlignment": "CENTER",
+                })
+        except Exception:
+            pass
 
 
 def load_seen_links(worksheet):
@@ -405,8 +420,10 @@ def append_job(sheet, job, seen_links, seen_jobs, is_offline_sync=False):
         STATS["skip"] += 1
         log("SKIP", f"{who}: {problem}")
         return False
-    description = clean_description(job.get("description", ""))
-    
+    questions_doc = job.get("questions_doc", "")
+    questions_count = job.get("questions_count", "None")
+    doc_cell = make_link_formula(questions_doc) if questions_doc else ""
+
     # Dynamically map values to header columns so extra or moved columns never break alignment
     try:
         headers = [h.strip().lower() for h in sheet.row_values(1)]
@@ -430,11 +447,13 @@ def append_job(sheet, job, seen_links, seen_jobs, is_offline_sync=False):
         set_val("date posted", date.today().strftime("%m/%d/%Y"))
         set_val("platform", job["platform"])
         set_val("job description", description)
+        set_val("questions doc link", doc_cell)
+        set_val("questions count", questions_count)
     else:
         row = [
             "=ROW()-1", job["company"], job["title"], job["location"], job["age"],
             make_link_formula(link), date.today().strftime("%m/%d/%Y"), job["platform"],
-            description,
+            description, doc_cell, questions_count
         ]
 
     for attempt in range(3):
@@ -613,29 +632,19 @@ async def main():
         for attempt in range(4):
             try:
                 log("INFO", f"phase=search keyword='{keyword}' location='{location_slug}' remote=True")
-                await page.goto("https://jobgether.com/", timeout=60000)
-                await page.evaluate("window.localStorage.clear(); window.sessionStorage.clear();")
-
-                # Wait for the cards themselves (not a fixed sleep), then until the card count stops changing.
-                # No cards after one retry is reported as a bot-check or as an empty result, not as a silent success.
-                for look in range(2):
-                    await page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+                await page.goto(target_url, wait_until="domcontentloaded", timeout=30000)
+                try:
+                    await page.wait_for_selector('a[href^="/offer/"]', timeout=12000)
+                except Exception:
                     try:
-                        await page.wait_for_selector('a[href^="/offer/"]', timeout=15000)
-                        break
+                        text = (await page.title()) + " " + (await page.inner_text("body"))[:500]
                     except Exception:
-                        if look == 0:
-                            log("WARN", "no job cards yet, loading the search page once more")
-                            continue
-                        try:
-                            text = (await page.title()) + " " + (await page.inner_text("body"))[:500]
-                        except Exception:
-                            text = ""
-                        if looks_like_captcha(page.url, text):
-                            STATS["status"] = "BOTCHECK"
-                            log("WARN", "the search page shows a bot-check; not trying to get past it")
-                        else:
-                            log("WARN", "the search page has no job cards")
+                        text = ""
+                    if looks_like_captcha(page.url, text):
+                        STATS["status"] = "BOTCHECK"
+                        log("WARN", "the search page shows a bot-check; not trying to get past it")
+                    else:
+                        log("WARN", "the search page has no job cards")
                 last, stable = -1, 0
                 for _ in range(20):
                     n = await page.locator('a[href^="/offer/"]').count()
@@ -670,7 +679,7 @@ async def main():
                     if (postedCard) {
                         const fullText = postedCard.innerText;
                         const lower = fullText.toLowerCase();
-                        if (lower.includes("just now") || lower.includes("just posted")) {
+                        if (lower.includes("just now") || lower.includes("just posted") || lower.includes("new")) {
                             posted = "Just Now";
                         } else if (lower.includes("today")) {
                             posted = "Today";
@@ -701,15 +710,8 @@ async def main():
             STATS["cards"] = len(cards)
             log("INFO", f"phase=collect {len(cards)} cards read")
 
-            # Cards are sorted newest-first (sort=date), so the first one
-            # older than 24h means everything after it is too - no need to
-            # keep scanning the rest of the page.
-            fresh_cards = []
-            for c in cards:
-                if is_within_24h(c["posted"]):
-                    fresh_cards.append(c)
-                else:
-                    break
+            # Collect all cards posted within the last 24 hours
+            fresh_cards = [c for c in cards if is_within_24h(c["posted"])]
             STATS["fresh"] = len(fresh_cards)
             log("INFO", f"{len(fresh_cards)} fresh (24h) of {len(cards)} cards")
 
@@ -773,15 +775,36 @@ async def main():
                             log("JOB", f"{who}: apply link found, read in {time.time() - job_start:.1f}s")
 
                         if apply_link:
+                            # IN THE SAME VISIT: Navigate to apply_link to extract questions and create Doc
+                            doc_url, q_count = "", "None"
+                            try:
+                                apply_tab = await context.new_page()
+                                try:
+                                    await apply_tab.goto(apply_link, wait_until="domcontentloaded", timeout=25000)
+                                    from question_extractor import extract_questions_and_create_doc_async
+                                    doc_url, q_count, _ = await extract_questions_and_create_doc_async(
+                                        apply_tab, context, card["company"], card["title"], apply_link
+                                    )
+                                    if doc_url:
+                                        log("INFO", f"[{card['company']} | {card['title']}] Form questions synced: {q_count} -> {doc_url}")
+                                finally:
+                                    await apply_tab.close()
+                            except Exception as q_err:
+                                log("WARN", f"In-flight question extraction note: {q_err}")
+
                             job_data = {
                                 "company": card["company"], "title": card["title"], "location": "United States",
                                 "age": card["posted"], "link": apply_link, "platform": "Jobgether",
                                 "description": description,
+                                "questions_doc": doc_url,
+                                "questions_count": q_count,
                             }
                             written = False
                             if sheet:
                                 async with write_lock:
                                     written = await asyncio.to_thread(append_job, sheet, job_data, seen_links, seen_jobs)
+                            else:
+                                log("WARN", f"{who}: sheet not connected; only in jobgether.xlsx")
                             if not written:
                                 # Save to offline cache if Google Sheet write failed or sheet was disconnected
                                 save_offline_job(job_data)
